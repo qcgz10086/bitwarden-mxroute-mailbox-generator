@@ -59,19 +59,15 @@ Admin 运行时必须有以下非 Secret 变量：
 - Admin 只有 `CORE`、`ASSETS` 和上述四项变量。
 - Generator/Admin 的 `CORE` 指向同一环境的 Core。
 
-### 2.4 创建 Access，再 Finalize 迁移和发布
+### 2.4 创建 Access，生成最终配置并做 dry-run，再发布
 
 ```powershell
 npm run check
 npm run build
 npm audit --omit=dev
-$configRoot = '.wrangler/environments/staging'
-npx wrangler deploy --dry-run --config "$configRoot/core.jsonc" --profile personal
-npx wrangler deploy --dry-run --config "$configRoot/generator.jsonc" --profile personal
-npx wrangler deploy --dry-run --config "$configRoot/admin.jsonc" --profile personal
 ```
 
-先按 2.5 创建保护 Admin 主机名的 Access 应用和 MFA policy，取得 Team Domain/AUD。确认 Access policy 已存在后执行：
+先按 2.5 创建保护 Admin 主机名的 Access 应用和 MFA policy，取得 Team Domain/AUD。确认 Access policy 已存在后先运行 Finalize `-WhatIf`：
 
 ```powershell
 .\scripts\bootstrap-cloudflare.ps1 `
@@ -79,8 +75,25 @@ npx wrangler deploy --dry-run --config "$configRoot/admin.jsonc" --profile perso
   -AccessTeamDomain 'https://team.cloudflareaccess.com' -AccessAud '复制的-aud-tag' `
   -AdminEmails 'admin@example.com' -AdminOrigin 'https://mail-admin.example.com' `
   -GeneratorHostname 'generator.example.com' -AdminHostname 'mail-admin.example.com' -WhatIf
+```
 
-# 核对 WhatIf 中的 account/environment/config/database/workers/domains 后改用 -Confirm
+`-WhatIf` 会写出包含最终 cron、Admin vars、环境 Worker/D1 和服务绑定的配置，但不会迁移或部署。现在、而不是 Prepare 后，对这三份**最终生成配置**做 dry-run：
+
+```powershell
+$configRoot = '.wrangler/environments/staging'
+npx wrangler deploy --dry-run --config "$configRoot/core.jsonc" --profile personal
+npx wrangler deploy --dry-run --config "$configRoot/generator.jsonc" --profile personal
+npx wrangler deploy --dry-run --config "$configRoot/admin.jsonc" --profile personal
+```
+
+逐项检查 dry-run 的绑定输出：Core 只有目标环境 D1；Generator 只有同环境 Core 和两个 Rate Limiter；Admin 只有同环境 Core、Assets 及四项预期 vars。Wrangler dry-run 不一定打印 cron/route，因此还要直接检查最终 `core.jsonc`：含 `*/5 * * * *`，`workers_dev=false`，没有 `routes`；所有配置中的 `account_id`、Worker 名称、D1 名称/ID和主机名必须与 WhatIf 摘要一致。检查通过后才运行相同的 Finalize 命令并使用 `-Confirm`：
+
+```powershell
+.\scripts\bootstrap-cloudflare.ps1 `
+  -Environment staging -AccountId $accountId -Phase Finalize -Profile personal `
+  -AccessTeamDomain 'https://team.cloudflareaccess.com' -AccessAud '复制的-aud-tag' `
+  -AdminEmails 'admin@example.com' -AdminOrigin 'https://mail-admin.example.com' `
+  -GeneratorHostname 'generator.example.com' -AdminHostname 'mail-admin.example.com' -Confirm
 ```
 
 Finalize 再次验证远程 D1 ID和五项 Core Secret，之后按顺序应用尚未执行的迁移、部署带 cron 的 Core、发布 Generator/Admin Custom Domain并生成类型。Core 始终没有 route、Custom Domain 或 `workers.dev` URL。Generator 的公开路径只有 `POST/OPTIONS /api/alias/random/new` 和 `GET /healthz`。不要手工重排、改写或跳过已上线迁移。

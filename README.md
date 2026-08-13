@@ -32,12 +32,32 @@ npx wrangler deploy --dry-run --config workers/generator/wrangler.jsonc
 npx wrangler deploy --dry-run --config workers/admin/wrangler.jsonc
 ```
 
+上面三条只验证仓库内本地测试模板能够打包，不认证 Prepare 配置，也不能作为实际环境的上线门禁。实际部署必须按下述顺序对 Finalize `-WhatIf` 生成的环境配置重新执行全部三条 dry-run。
+
 完整的 Cloudflare 初始化、Access、Bitwarden 配置、轮换、恢复和真实预发布验收步骤见 [docs/operations.md](docs/operations.md)。脚本支持 `-WhatIf`，先预览：
 
 ```powershell
 $accountId = '0123456789abcdef0123456789abcdef'
-.\scripts\bootstrap-cloudflare.ps1 -Environment staging -AccountId $accountId -Phase Prepare -WhatIf
-.\scripts\set-secrets.ps1 -Environment staging -AccountId $accountId -WhatIf
+.\scripts\bootstrap-cloudflare.ps1 -Environment staging -AccountId $accountId -Phase Prepare -Confirm
+.\scripts\set-secrets.ps1 -Environment staging -AccountId $accountId -Confirm
+```
+
+创建 Access 应用并取得 Admin 输入后，先执行 Finalize `-WhatIf`；它只生成最终配置并预览操作，不部署。然后对最终生成的三份配置逐一 dry-run，检查绑定、Core 无 route/`workers.dev`、cron 和 Admin vars，最后才执行同一条 Finalize 命令并把 `-WhatIf` 改为 `-Confirm`：
+
+```powershell
+.\scripts\bootstrap-cloudflare.ps1 `
+  -Environment staging -AccountId $accountId -Phase Finalize `
+  -AccessTeamDomain 'https://team.cloudflareaccess.com' -AccessAud '复制的-aud-tag' `
+  -AdminEmails 'admin@example.com' -AdminOrigin 'https://mail-admin.example.com' `
+  -GeneratorHostname 'generator.example.com' -AdminHostname 'mail-admin.example.com' -WhatIf
+npx wrangler deploy --dry-run --config .wrangler/environments/staging/core.jsonc
+npx wrangler deploy --dry-run --config .wrangler/environments/staging/generator.jsonc
+npx wrangler deploy --dry-run --config .wrangler/environments/staging/admin.jsonc
+.\scripts\bootstrap-cloudflare.ps1 `
+  -Environment staging -AccountId $accountId -Phase Finalize `
+  -AccessTeamDomain 'https://team.cloudflareaccess.com' -AccessAud '复制的-aud-tag' `
+  -AdminEmails 'admin@example.com' -AdminOrigin 'https://mail-admin.example.com' `
+  -GeneratorHostname 'generator.example.com' -AdminHostname 'mail-admin.example.com' -Confirm
 ```
 
 部署脚本只使用 `.wrangler/environments/<environment>` 下按环境生成且被 Git 忽略的配置，不会改写仓库中的生产模板。每次远程写操作前都会把预期 Account ID 与 `wrangler whoami` 核对，并校验 D1、Worker 名称、服务绑定和公网路由。完整顺序是：Prepare 私有 Core shell → 交互设置 Secret → 创建 Access/MFA policy → Finalize 迁移并发布。

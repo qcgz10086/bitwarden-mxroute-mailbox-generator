@@ -1,8 +1,12 @@
 [CmdletBinding()]
-param([string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot))
+param([string]$ProjectRoot)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    throw 'PowerShell 7 or newer is required to run operations safety tests.'
+}
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath) }
 
 $root = (Resolve-Path -LiteralPath $ProjectRoot).Path
 $bootstrapPath = Join-Path $root 'scripts/bootstrap-cloudflare.ps1'
@@ -10,6 +14,8 @@ $secretsPath = Join-Path $root 'scripts/set-secrets.ps1'
 $bootstrap = Get-Content -LiteralPath $bootstrapPath -Raw
 $secrets = Get-Content -LiteralPath $secretsPath -Raw
 $gitignore = Get-Content -LiteralPath (Join-Path $root '.gitignore') -Raw
+$readme = Get-Content -LiteralPath (Join-Path $root 'README.md') -Raw
+$operations = Get-Content -LiteralPath (Join-Path $root 'docs/operations.md') -Raw
 
 foreach ($path in @($bootstrapPath, $secretsPath, $PSCommandPath)) {
     $tokens = $null
@@ -34,6 +40,14 @@ if (($bootstrap + $secrets) -match '(?i)--value|PtrToString|ConvertFrom-SecureSt
 }
 foreach ($required in @('Cloudflare API.txt', 'MXroute Email Hosting API.txt')) {
     if (-not $gitignore.Contains($required)) { throw "Missing credential-file ignore: $required" }
+}
+foreach ($document in @($readme, $operations)) {
+    $finalizeWhatIf = $document.IndexOf('-Phase Finalize')
+    $finalConfigDryRun = $document.IndexOf('.wrangler/environments/', $finalizeWhatIf)
+    $finalizeConfirm = $document.IndexOf('-Phase Finalize', $finalizeWhatIf + 1)
+    if ($finalizeWhatIf -lt 0 -or $finalConfigDryRun -lt $finalizeWhatIf -or $finalizeConfirm -lt $finalConfigDryRun) {
+        throw 'Documentation must order Finalize -WhatIf, final generated-config dry-runs, then Finalize -Confirm.'
+    }
 }
 
 # Execute only the config builder/validator functions from bootstrap. The main

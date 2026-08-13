@@ -20,7 +20,7 @@ param(
     [string]$AdminOrigin,
     [string]$GeneratorHostname,
     [string]$AdminHostname,
-    [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot)
+    [string]$ProjectRoot
 )
 
 Set-StrictMode -Version Latest
@@ -190,6 +190,7 @@ function Assert-FinalInputs {
 }
 
 if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'PowerShell 7 or newer is required.' }
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath) }
 $root = (Resolve-Path -LiteralPath $ProjectRoot).Path
 foreach ($required in @('package.json', 'workers/core/src/index.ts', 'workers/core/migrations/0001.sql')) {
     if (-not (Test-Path -LiteralPath (Join-Path $root $required) -PathType Leaf)) { throw "Invalid ProjectRoot: missing $required" }
