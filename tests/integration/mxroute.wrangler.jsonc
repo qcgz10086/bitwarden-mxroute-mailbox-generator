@@ -1,0 +1,7 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "integration-mxroute",
+  "main": "mxroute.ts",
+  "compatibility_date": "2026-08-13",
+  "workers_dev": false
+}

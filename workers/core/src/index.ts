@@ -27,6 +27,7 @@ export interface CoreEnv {
   readonly MXROUTE_API_KEY: string;
   readonly TOKEN_PEPPER: string;
   readonly ENC_KEY_V1: string;
+  readonly MXROUTE_FETCH?: Fetcher;
 }
 
 export class CoreService extends WorkerEntrypoint<CoreEnv> {
@@ -36,7 +37,7 @@ export class CoreService extends WorkerEntrypoint<CoreEnv> {
       server: this.env.MXROUTE_SERVER,
       username: this.env.MXROUTE_USERNAME,
       apiKey: this.env.MXROUTE_API_KEY,
-    });
+    }, this.mxrouteDependencies());
     return new MailboxService({
       repository,
       mxroute,
@@ -102,11 +103,17 @@ export class CoreService extends WorkerEntrypoint<CoreEnv> {
         server: this.env.MXROUTE_SERVER,
         username: this.env.MXROUTE_USERNAME,
         apiKey: this.env.MXROUTE_API_KEY,
-      }),
+      }, this.mxrouteDependencies()),
       tokenPepper: this.env.TOKEN_PEPPER,
       encryptionKeys: { 1: this.env.ENC_KEY_V1 },
       encryptionKeyVersion: 1,
     });
+  }
+
+  private mxrouteDependencies(): import("./mxroute").MxrouteClientDependencies {
+    return this.env.MXROUTE_FETCH === undefined ? {} : {
+      fetch: (input, init) => this.env.MXROUTE_FETCH!.fetch(input, init),
+    };
   }
 }
 
