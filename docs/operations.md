@@ -11,43 +11,37 @@
 | Generator | `bitwarden-mxroute-generator-staging` | `bitwarden-mxroute-generator` |
 | Admin | `bitwarden-mxroute-admin-staging` | `bitwarden-mxroute-admin` |
 
-仓库中的 Wrangler 配置是生产模板。共用账户部署预发布时，先在一个独立、干净的 checkout 中复制三份配置，并把三个 Worker 的 `name` 和 Generator/Admin 的 `services[].service` 一起改为预发布名称。不要让预发布绑定生产 Core。每个环境各用一个 checkout，可避免 `d1 create --update-config` 把另一个环境的 D1 ID 覆盖掉。
+仓库中的三个 Wrangler 配置只用于本地测试模板，部署脚本绝不修改它们。脚本为每个环境生成 `.wrangler/environments/<environment>/{core,generator,admin}.jsonc`；该目录被 Git 忽略。生成时固定并复核 Cloudflare Account ID、环境 Worker 名称、D1 名称/ID、Generator/Admin 的 Core 服务目标、`workers_dev=false` 和 Core 无公网路由，预发布不能覆盖或绑定生产资源。
 
-前置条件：Node.js 22+、`npm ci` 完成、Wrangler 已登录、两个公开 HTTPS 主机名（Generator/Admin）、MXroute API 凭据、至少一个已在 MXroute 配置好的域名。Cloudflare 和身份提供商账号都启用 MFA；部署令牌只授予所需账户的 Workers、D1、路由和 Access 最小权限。
+前置条件：PowerShell 7+、Node.js 22+、`npm ci` 完成、Wrangler 已登录、已人工从 Cloudflare 仪表板复制目标账户的 32 位 Account ID、两个公开 HTTPS 主机名（Generator/Admin）、MXroute API 凭据、至少一个已在 MXroute 配置好的域名。Cloudflare 和身份提供商账号都启用 MFA；部署令牌只授予该 Account ID 下所需的 Workers、D1、路由和 Access 最小权限。脚本可选 `-Profile <wrangler-profile>`，并从 `wrangler whoami` 输出提取所有 Account ID，只有明确包含预期值才继续。
 
 ## 2. 部署顺序
 
 以下示例先部署预发布。运行会修改远程状态的命令前先使用 `-WhatIf` 或 `--dry-run`。
 
-### 2.1 创建 D1、迁移和类型
+### 2.1 Prepare：创建 D1 和私有 Core shell
 
 ```powershell
 npx wrangler whoami
-.\scripts\bootstrap-cloudflare.ps1 -Environment staging -WhatIf
-.\scripts\bootstrap-cloudflare.ps1 -Environment staging -Confirm
+$accountId = '0123456789abcdef0123456789abcdef' # 从 Cloudflare 仪表板复制
+.\scripts\bootstrap-cloudflare.ps1 -Environment staging -AccountId $accountId -Phase Prepare -Profile personal -WhatIf
+.\scripts\bootstrap-cloudflare.ps1 -Environment staging -AccountId $accountId -Phase Prepare -Profile personal -Confirm
 ```
 
-脚本只接受 `staging`/`production`，检查项目路径、Node 版本、连续的 `0001.sql`、`0002.sql` 顺序和 Wrangler 登录。它先按精确名称查询 D1；不存在时运行 `wrangler d1 create ... --binding DB --update-config`，然后对 Core 配置运行：
-
-```powershell
-npx wrangler d1 migrations apply DB --remote --config workers/core/wrangler.jsonc
-npm run types
-```
-
-迁移命令是可重复的，只应用尚未记录的迁移。不要手工重排、改写或跳过已上线的迁移。脚本若发现同名 D1 已存在但当前配置没有相同名称/UUID，会停止，不会猜测或覆盖绑定。
+Prepare 只接受 `staging`/`production`，先完成账户、项目路径、Node、连续的 `0001.sql`、`0002.sql`、三个生成配置和服务绑定校验。它按精确环境名称查询 D1；不存在时只对生成的 Core 配置执行 `d1 create --binding DB --update-config`。随后部署一个使用真实 Core 代码但没有 route、`workers.dev`、Custom Domain 或 cron 的私有 shell，使下一步 `secret list/put` 有确定的目标。此时 Core 没有公网入口，也不会运行恢复计划任务；脚本不会让重定向的 Secret stdin 被 Wrangler 的“是否创建 Worker”提示占用。
 
 ### 2.2 设置 Core Secret
 
 Secret 不作为参数出现，也不写入命令历史、文件或脚本输出：
 
 ```powershell
-.\scripts\set-secrets.ps1 -Environment staging -WhatIf
-.\scripts\set-secrets.ps1 -Environment staging -Confirm
+.\scripts\set-secrets.ps1 -Environment staging -AccountId $accountId -Profile personal -WhatIf
+.\scripts\set-secrets.ps1 -Environment staging -AccountId $accountId -Profile personal -Confirm
 ```
 
 脚本对 `MXROUTE_SERVER`、`MXROUTE_USERNAME`、`MXROUTE_API_KEY` 使用受保护的交互输入；`TOKEN_PEPPER` 和 `ENC_KEY_V1` 在本机用 `RandomNumberGenerator.Fill` 生成 32 字节随机值，并直接送入 `wrangler secret put` 的标准输入。Wrangler 输出被丢弃，只显示 Secret 名称和 `SET`/`PRESENT`。已有生成密钥不会被覆盖；`-RotateMxroute` 只轮换三项 MXroute 值。
 
-如果目标 Core 尚不存在且 Wrangler 不能为 `secret put` 建立初始 Worker，先对 Core 执行一次 `deploy --dry-run`，然后按 Wrangler 提示建立 Worker shell；不要向可访问的 Core 发请求。完成 Secret 设置后再正式部署。
+脚本要求 Prepare 创建的 Core shell 已存在；`secret list` 失败时立即停止，不会把 Secret 内容送进一个确认提示。每次写入前再次验证 Account ID、环境生成配置、Worker 名称、D1 和服务绑定。不要跳过 Prepare，也不要手工用 `--value` 设置 Secret。
 
 ### 2.3 配置非 Secret 变量和服务绑定
 
@@ -58,29 +52,38 @@ Admin 运行时必须有以下非 Secret 变量：
 - `ADMIN_EMAILS`：允许的管理员邮箱，逗号分隔。
 - `ADMIN_ORIGIN`：Admin 的精确 origin，例如 `https://mail-admin.example.com`，不能有结尾 `/`。
 
-把这些放在目标环境 Admin 配置的 `vars` 中，或通过 Cloudflare 配置管理。若在仪表板设置变量，部署时使用 `--keep-vars`，否则 Wrangler 可能删除配置文件未声明的变量。它们不是密码，但仍要经过变更审查。确认：
+这些值由 Finalize 参数写入被忽略的环境 Admin 配置；它们不是密码，但仍要经过变更审查。确认：
 
 - Core 配置只有 `DB` 和五项 Secret，`workers_dev` 为 `false`，没有 `routes`。
 - Generator 只有 `CORE`、`PREAUTH_RATE_LIMITER`（30/60 秒）和 `TOKEN_RATE_LIMITER`（5/60 秒）。
 - Admin 只有 `CORE`、`ASSETS` 和上述四项变量。
 - Generator/Admin 的 `CORE` 指向同一环境的 Core。
 
-### 2.4 构建、部署和自定义域名
+### 2.4 创建 Access，再 Finalize 迁移和发布
 
 ```powershell
 npm run check
 npm run build
 npm audit --omit=dev
-npx wrangler deploy --dry-run --config workers/core/wrangler.jsonc
-npx wrangler deploy --dry-run --config workers/generator/wrangler.jsonc
-npx wrangler deploy --dry-run --config workers/admin/wrangler.jsonc
-
-npx wrangler deploy --config workers/core/wrangler.jsonc
-npx wrangler deploy --config workers/generator/wrangler.jsonc --domain generator.example.com
-npx wrangler deploy --config workers/admin/wrangler.jsonc --domain mail-admin.example.com --keep-vars
+$configRoot = '.wrangler/environments/staging'
+npx wrangler deploy --dry-run --config "$configRoot/core.jsonc" --profile personal
+npx wrangler deploy --dry-run --config "$configRoot/generator.jsonc" --profile personal
+npx wrangler deploy --dry-run --config "$configRoot/admin.jsonc" --profile personal
 ```
 
-按 Core、Generator、Admin 的顺序部署。`--domain` 示例要替换为实际主机名；也可以在 Cloudflare Workers 路由界面绑定 Custom Domain。再次确认 Core 没有 Custom Domain、route 或 `workers.dev` URL。Generator 的公开路径只有 `POST/OPTIONS /api/alias/random/new` 和 `GET /healthz`。
+先按 2.5 创建保护 Admin 主机名的 Access 应用和 MFA policy，取得 Team Domain/AUD。确认 Access policy 已存在后执行：
+
+```powershell
+.\scripts\bootstrap-cloudflare.ps1 `
+  -Environment staging -AccountId $accountId -Phase Finalize -Profile personal `
+  -AccessTeamDomain 'https://team.cloudflareaccess.com' -AccessAud '复制的-aud-tag' `
+  -AdminEmails 'admin@example.com' -AdminOrigin 'https://mail-admin.example.com' `
+  -GeneratorHostname 'generator.example.com' -AdminHostname 'mail-admin.example.com' -WhatIf
+
+# 核对 WhatIf 中的 account/environment/config/database/workers/domains 后改用 -Confirm
+```
+
+Finalize 再次验证远程 D1 ID和五项 Core Secret，之后按顺序应用尚未执行的迁移、部署带 cron 的 Core、发布 Generator/Admin Custom Domain并生成类型。Core 始终没有 route、Custom Domain 或 `workers.dev` URL。Generator 的公开路径只有 `POST/OPTIONS /api/alias/random/new` 和 `GET /healthz`。不要手工重排、改写或跳过已上线迁移。
 
 ### 2.5 Cloudflare Access
 
@@ -141,7 +144,7 @@ npx wrangler deploy --config workers/admin/wrangler.jsonc --domain mail-admin.ex
 先在 MXroute 创建/启用新 Key，在管理页关闭生成并等待进行中的请求结束，然后在维护窗口执行：
 
 ```powershell
-.\scripts\set-secrets.ps1 -Environment production -RotateMxroute -Confirm
+.\scripts\set-secrets.ps1 -Environment production -AccountId $accountId -Profile personal -RotateMxroute -Confirm
 ```
 
 对域名同步、创建/重置/删除各做预发布测试，再撤销旧 Key。此开关会重新输入 Server、Username、API Key，避免混用一组凭据。
@@ -158,7 +161,7 @@ npx wrangler deploy --config workers/admin/wrangler.jsonc --domain mail-admin.ex
 
 ### 失败状态恢复
 
-Core 每五分钟运行恢复任务，有限批次处理 `pending`、`resetting/reset_unknown`、`deleting/delete_failed`。超时场景保留加密候选密码并幂等重试，避免 MXroute 已改密码而本地丢失。查看管理页状态和审计 request ID；不要直接编辑密文、nonce、状态或计数。`delete_failed` 可重试永久删除。上游持续故障时先关闭生成，修复凭据/服务后让定时任务恢复。
+Core 每五分钟运行恢复任务，有限批次处理 `pending`、`resetting/reset_unknown` 和仍处于 `deleting` 的记录；当前 cron **不会自动选择 `delete_failed`**。超时场景保留加密候选密码并幂等重试，避免 MXroute 已改密码而本地丢失。查看管理页状态和审计 request ID；不要直接编辑密文、nonce、状态或计数。`delete_failed` 必须由管理员在管理页确认完整邮箱后手工重试永久删除。上游持续故障时先关闭生成，修复凭据/服务后再手工重试，并让定时任务处理其他可恢复状态。
 
 ### 日志和导出脱敏
 
@@ -178,14 +181,15 @@ Worker 回滚与数据库回滚是两件事。先关闭生成并保存当前 D1 
 npm run check
 npm run build
 npm audit --omit=dev
-npx wrangler deploy --dry-run --config workers/core/wrangler.jsonc
-npx wrangler deploy --dry-run --config workers/generator/wrangler.jsonc
-npx wrangler deploy --dry-run --config workers/admin/wrangler.jsonc
-npm run types
+$configRoot = '.wrangler/environments/staging'
+npx wrangler deploy --dry-run --config "$configRoot/core.jsonc" --profile personal
+npx wrangler deploy --dry-run --config "$configRoot/generator.jsonc" --profile personal
+npx wrangler deploy --dry-run --config "$configRoot/admin.jsonc" --profile personal
+pwsh -File scripts/test-operations.ps1
 New-Item -ItemType Directory -Force work/types | Out-Null
-npx wrangler types work/types/core.d.ts --include-runtime false --env-interface CoreGeneratedEnv --config workers/core/wrangler.jsonc
-npx wrangler types work/types/generator.d.ts --include-runtime false --env-interface GeneratorGeneratedEnv --config workers/generator/wrangler.jsonc
-npx wrangler types work/types/admin.d.ts --include-runtime false --env-interface AdminGeneratedEnv --config workers/admin/wrangler.jsonc
+npx wrangler types work/types/core.d.ts --include-runtime false --env-interface CoreGeneratedEnv --config "$configRoot/core.jsonc" --profile personal
+npx wrangler types work/types/generator.d.ts --include-runtime false --env-interface GeneratorGeneratedEnv --config "$configRoot/generator.jsonc" --profile personal
+npx wrangler types work/types/admin.d.ts --include-runtime false --env-interface AdminGeneratedEnv --config "$configRoot/admin.jsonc" --profile personal
 git diff --check
 git status --short
 ```

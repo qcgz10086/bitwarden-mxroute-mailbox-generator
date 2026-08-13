@@ -35,8 +35,13 @@ npx wrangler deploy --dry-run --config workers/admin/wrangler.jsonc
 完整的 Cloudflare 初始化、Access、Bitwarden 配置、轮换、恢复和真实预发布验收步骤见 [docs/operations.md](docs/operations.md)。脚本支持 `-WhatIf`，先预览：
 
 ```powershell
-.\scripts\bootstrap-cloudflare.ps1 -Environment staging -WhatIf
-.\scripts\set-secrets.ps1 -Environment staging -WhatIf
+$accountId = '0123456789abcdef0123456789abcdef'
+.\scripts\bootstrap-cloudflare.ps1 -Environment staging -AccountId $accountId -Phase Prepare -WhatIf
+.\scripts\set-secrets.ps1 -Environment staging -AccountId $accountId -WhatIf
 ```
 
+部署脚本只使用 `.wrangler/environments/<environment>` 下按环境生成且被 Git 忽略的配置，不会改写仓库中的生产模板。每次远程写操作前都会把预期 Account ID 与 `wrangler whoami` 核对，并校验 D1、Worker 名称、服务绑定和公网路由。完整顺序是：Prepare 私有 Core shell → 交互设置 Secret → 创建 Access/MFA policy → Finalize 迁移并发布。
+
 不要提交 `.dev.vars`、`.env`、Wrangler 状态目录或生成的环境配置。真实部署和桌面/手机烟测需要操作者登录 Cloudflare、MXroute 和 Bitwarden 后完成；本仓库的本地测试不会执行这些外部变更。
+
+如果本机存在 `Cloudflare API.txt` 或 `MXroute Email Hosting API.txt`，它们只允许留在本地：不要打印、解析、上传或提交。`.gitignore` 已对这两个精确文件名提供额外保护；部署脚本也不会自动读取它们，所有 Secret 仍通过受保护的交互输入或本机密码学随机数进入 Wrangler stdin。

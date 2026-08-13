@@ -5,6 +5,8 @@ node_modules/
 .wrangler/
 .dev.vars*
 .env*
+Cloudflare API.txt
+MXroute Email Hosting API.txt
 dist/
 coverage/
 worker-configuration.d.ts
