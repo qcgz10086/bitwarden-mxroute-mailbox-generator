@@ -136,7 +136,7 @@ interface TokenWorkflowDependencies {
   revoke(id: string): Promise<unknown>;
   display(rawToken: string): void;
   clear(): void;
-  report(code: "TOKEN_CREATE_FAILED" | "TOKEN_COMPENSATION_FAILED"): void;
+  report(code: "TOKEN_CREATE_FAILED" | "TOKEN_COMPENSATION_FAILED" | "TOKEN_DISPLAY_FAILED_COMPENSATED" | "TOKEN_DISPLAY_FAILED_COMPENSATION_FAILED"): void;
 }
 export class TokenCreationWorkflow {
   private contextActive = true;
@@ -145,25 +145,34 @@ export class TokenCreationWorkflow {
   private rawToken: string | null = null;
   private tokenId: string | null = null;
   private saved = false;
-  private readonly revocations = new Map<string, Promise<void>>();
+  private readonly revocations = new Map<string, Promise<boolean>>();
   constructor(private readonly dependencies: TokenWorkflowDependencies) {}
   busy(): boolean { return this.creating || this.rawToken !== null; }
-  async create(name: string): Promise<"displayed" | "revoked" | "failed" | "busy"> {
+  async create(name: string): Promise<"displayed" | "revoked" | "failed" | "busy" | "display-compensated" | "display-compensation-failed"> {
     if (this.busy() || !this.contextActive) return "busy";
     this.creating = true; const generation = ++this.generation;
+    let result: { id: string; rawToken: string };
     try {
-      const result = await this.dependencies.create(name); this.creating = false;
-      if (this.contextActive && generation === this.generation && this.rawToken === null) {
-        this.rawToken = result.rawToken; this.tokenId = result.id; this.saved = false; this.dependencies.display(result.rawToken); return "displayed";
-      }
-      await this.revokeOnce(result.id); return "revoked";
+      result = await this.dependencies.create(name);
     } catch {
       this.creating = false; if (this.contextActive && generation === this.generation) this.dependencies.report("TOKEN_CREATE_FAILED"); return "failed";
     }
+    this.creating = false;
+    if (!this.contextActive || generation !== this.generation || this.rawToken !== null) { await this.revokeOnce(result.id); return "revoked"; }
+    this.rawToken = result.rawToken; this.tokenId = result.id; this.saved = false;
+    try { this.dependencies.display(result.rawToken); return "displayed"; }
+    catch {
+      this.clearDisplay(); const compensated = await this.revokeOnce(result.id, false);
+      if (this.contextActive) this.dependencies.report(compensated ? "TOKEN_DISPLAY_FAILED_COMPENSATED" : "TOKEN_DISPLAY_FAILED_COMPENSATION_FAILED");
+      return compensated ? "display-compensated" : "display-compensation-failed";
+    }
   }
   async copyTo(writeText: (value: string) => Promise<void>): Promise<boolean> {
-    const current = this.rawToken; if (current === null || !this.contextActive) return false;
-    await writeText(current); if (this.rawToken === current) this.saved = true; return true;
+    const current = this.rawToken; const id = this.tokenId; const generation = this.generation;
+    if (current === null || id === null || !this.contextActive) return false;
+    await writeText(current);
+    if (!this.contextActive || generation !== this.generation || this.rawToken !== current || this.tokenId !== id || this.revocations.has(id)) return false;
+    this.saved = true; return true;
   }
   dismissSaved(): void { this.saved = true; this.clearDisplay(); }
   closeWithoutSave(): void {
@@ -176,10 +185,10 @@ export class TokenCreationWorkflow {
     this.clearDisplay(); if (shouldRevoke) void this.revokeOnce(id);
   }
   async compensation(): Promise<void> { await Promise.all(this.revocations.values()); }
-  private clearDisplay(): void { this.rawToken = null; this.tokenId = null; this.saved = false; this.dependencies.clear(); }
-  private revokeOnce(id: string): Promise<void> {
+  private clearDisplay(): void { this.generation += 1; this.rawToken = null; this.tokenId = null; this.saved = false; try { this.dependencies.clear(); } catch {} }
+  private revokeOnce(id: string, reportFailure = true): Promise<boolean> {
     const existing = this.revocations.get(id); if (existing) return existing;
-    const operation = this.dependencies.revoke(id).then(() => undefined).catch(() => { if (this.contextActive) this.dependencies.report("TOKEN_COMPENSATION_FAILED"); });
+    const operation = this.dependencies.revoke(id).then(() => true).catch(() => { if (reportFailure && this.contextActive) this.dependencies.report("TOKEN_COMPENSATION_FAILED"); return false; });
     this.revocations.set(id, operation); return operation;
   }
 }
@@ -358,7 +367,15 @@ function bind(): void {
     revoke: (id) => api.mutate(`/api/tokens/${encodeURIComponent(id)}`, "DELETE"),
     display: (rawToken) => { concealAllMailboxSecrets(); text(byId("raw-token"), rawToken); tokenDialog.showModal(); },
     clear: () => { text(byId("raw-token"), ""); tokenButton.disabled = false; },
-    report: (code) => status(code === "TOKEN_CREATE_FAILED" ? "Token creation failed." : "Token could not be safely revoked; revoke it from the token list."),
+    report: (code) => {
+      const messages = {
+        TOKEN_CREATE_FAILED: "Token creation failed.",
+        TOKEN_COMPENSATION_FAILED: "Token could not be safely revoked; revoke it from the token list.",
+        TOKEN_DISPLAY_FAILED_COMPENSATED: "Token display failed, so the created token was revoked. Create a new token.",
+        TOKEN_DISPLAY_FAILED_COMPENSATION_FAILED: "Token display failed and automatic revocation failed; revoke the newest token from the token list.",
+      } as const;
+      status(messages[code]);
+    },
   });
   byId("mailbox-filter").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); void loadMailboxes().catch(fail); }); byId("mailbox-next").addEventListener("click", () => { if (mailboxCursor) void loadMailboxes(mailboxCursor).catch(fail); });
   byId("sync-domains").addEventListener("click", () => void api.mutate<readonly Domain[]>("/api/domains/sync", "POST").then(async () => { await loadDomains(); await loadSettings(); }).catch(fail));
@@ -367,7 +384,7 @@ function bind(): void {
   byId("token-form").addEventListener("submit", (event: { preventDefault(): void }) => {
     event.preventDefault(); const name = byId<HTMLInputElement>("token-name").value.trim(); if (!name) return;
     if (tokenWorkflow.busy()) return status("Save or dismiss the current token before creating another."); tokenButton.disabled = true;
-    void tokenWorkflow.create(name).then(async (result) => { tokenButton.disabled = tokenWorkflow.busy(); if (result === "displayed" || result === "revoked") await loadTokens(); }).catch(fail);
+    void tokenWorkflow.create(name).then(async (result) => { tokenButton.disabled = tokenWorkflow.busy(); if (result !== "failed" && result !== "busy") await loadTokens(); }).catch(fail);
   });
   byId("copy-token").addEventListener("click", () => { void tokenWorkflow.copyTo((value) => navigator.clipboard.writeText(value)).then((copied) => { if (copied) status("Token copied and marked as saved."); }).catch(fail); });
   tokenDialog.addEventListener("close", () => tokenWorkflow.closeWithoutSave());

@@ -218,6 +218,38 @@ describe("sensitive event workflows", () => {
     expect(JSON.stringify(report.mock.calls)).not.toContain("never-log-this");
   });
 
+  it("compensates a created token when display throws without misreporting creation failure", async () => {
+    const revoke = vi.fn(async () => undefined); const report = vi.fn(); const clear = vi.fn();
+    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "created-id", rawToken: "display-secret" })), revoke, display: vi.fn(() => { throw new Error("DOM detached: display-secret"); }), clear, report });
+    await expect(workflow.create("broken-display")).resolves.toBe("display-compensated");
+    expect(revoke).toHaveBeenCalledExactlyOnceWith("created-id"); expect(clear).toHaveBeenCalled(); expect(workflow.busy()).toBe(false);
+    expect(report).toHaveBeenCalledWith("TOKEN_DISPLAY_FAILED_COMPENSATED"); expect(report).not.toHaveBeenCalledWith("TOKEN_CREATE_FAILED");
+    expect(JSON.stringify(report.mock.calls)).not.toContain("display-secret");
+  });
+
+  it("keeps display-compensation failure secret-free and the workflow reusable", async () => {
+    const report = vi.fn(); const revoke = vi.fn(async () => { throw new Error("secret upstream detail"); });
+    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "created-id", rawToken: "raw-never-report" })), revoke, display: vi.fn(() => { throw new Error("display failed raw-never-report"); }), clear: vi.fn(), report });
+    await expect(workflow.create("broken-display")).resolves.toBe("display-compensation-failed");
+    expect(revoke).toHaveBeenCalledExactlyOnceWith("created-id"); expect(workflow.busy()).toBe(false);
+    expect(report).toHaveBeenCalledWith("TOKEN_DISPLAY_FAILED_COMPENSATION_FAILED");
+    expect(JSON.stringify(report.mock.calls)).not.toContain("raw-never-report");
+  });
+
+  it("does not mark a token saved when close invalidates it while clipboard is pending", async () => {
+    const clipboard = deferred<void>(); const revoke = vi.fn(async () => undefined);
+    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t-close", rawToken: "raw-close" })), revoke, display: vi.fn(), clear: vi.fn(), report: vi.fn() });
+    await workflow.create("close"); const copying = workflow.copyTo(() => clipboard.promise); workflow.closeWithoutSave(); clipboard.resolve();
+    await expect(copying).resolves.toBe(false); await workflow.compensation(); expect(revoke).toHaveBeenCalledExactlyOnceWith("t-close");
+  });
+
+  it("does not announce saved when pagehide invalidates a pending clipboard write", async () => {
+    const clipboard = deferred<void>(); const revoke = vi.fn(async () => undefined);
+    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t-hide", rawToken: "raw-hide" })), revoke, display: vi.fn(), clear: vi.fn(), report: vi.fn() });
+    await workflow.create("hide"); const copying = workflow.copyTo(() => clipboard.promise); workflow.pagehide(); clipboard.resolve();
+    await expect(copying).resolves.toBe(false); await workflow.compensation(); expect(revoke).toHaveBeenCalledExactlyOnceWith("t-hide");
+  });
+
   it("filters default-domain choices to active domains and keeps exact delete semantics", () => {
     expect(activeDomainNames([{ domain: "active.example", active: true }, { domain: "old.example", active: false }])).toEqual(["active.example"]);
     expect(validateDeleteConfirmation("victim@example.com", "victim@example.com")).toBe(true);
