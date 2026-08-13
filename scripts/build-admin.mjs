@@ -1,6 +1,7 @@
 import { build, transform } from "esbuild";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { findUnsafeAssetContent } from "./admin-asset-policy.mjs";
 
 const root = new URL("../", import.meta.url);
 const ui = new URL("workers/admin/ui/", root);
@@ -10,7 +11,8 @@ await build({ entryPoints: [fileURLToPath(new URL("app.ts", ui))], outfile: file
 const css = await readFile(new URL("styles.css", ui), "utf8");
 const minified = await transform(css, { loader: "css", minify: true, target: "es2023", legalComments: "none", sourcemap: false });
 await writeFile(new URL("styles.css", output), minified.code, "utf8");
-for (const name of ["app.js", "styles.css"]) {
+for (const name of ["index.html", "app.js", "styles.css"]) {
   const content = await readFile(new URL(name, output), "utf8");
-  if (/\beval\s*\(/.test(content) || /sourceMappingURL/i.test(content) || /https?:\/\//i.test(content) || /MXROUTE_API_KEY|TOKEN_PEPPER|ENC_KEY_V\d|Cf-Access-Jwt-Assertion|Authentication\s*:/i.test(content)) throw new Error(`Unsafe content detected in ${name}`);
+  const violation = findUnsafeAssetContent(content);
+  if (violation) throw new Error(`Unsafe content detected in ${name}: ${violation}`);
 }
