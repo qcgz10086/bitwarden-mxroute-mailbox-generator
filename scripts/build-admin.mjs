@@ -1,18 +1,16 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { build, transform } from "esbuild";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
-const publicDirectory = new URL("../workers/admin/public/", import.meta.url);
-const indexHtml = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Mailbox Admin</title>
-  </head>
-  <body>
-    <main>Mailbox administration interface placeholder.</main>
-  </body>
-</html>
-`;
-
-await mkdir(publicDirectory, { recursive: true });
-await writeFile(new URL("index.html", publicDirectory), indexHtml, "utf8");
+const root = new URL("../", import.meta.url);
+const ui = new URL("workers/admin/ui/", root);
+const output = new URL("workers/admin/public/", root);
+await mkdir(output, { recursive: true });
+await build({ entryPoints: [fileURLToPath(new URL("app.ts", ui))], outfile: fileURLToPath(new URL("app.js", output)), bundle: true, format: "esm", target: "es2023", minify: true, legalComments: "none", sourcemap: false, charset: "utf8", logLevel: "silent" });
+const css = await readFile(new URL("styles.css", ui), "utf8");
+const minified = await transform(css, { loader: "css", minify: true, target: "es2023", legalComments: "none", sourcemap: false });
+await writeFile(new URL("styles.css", output), minified.code, "utf8");
+for (const name of ["app.js", "styles.css"]) {
+  const content = await readFile(new URL(name, output), "utf8");
+  if (/\beval\s*\(/.test(content) || /sourceMappingURL/i.test(content) || /https?:\/\//i.test(content) || /MXROUTE_API_KEY|TOKEN_PEPPER|ENC_KEY_V\d|Cf-Access-Jwt-Assertion|Authentication\s*:/i.test(content)) throw new Error(`Unsafe content detected in ${name}`);
+}
