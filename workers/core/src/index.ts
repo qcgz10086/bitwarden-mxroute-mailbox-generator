@@ -50,6 +50,10 @@ export class CoreService extends WorkerEntrypoint<CoreEnv> {
     return this.administration().pageMailboxes(identity, options);
   }
 
+  listDomains(identity: AdminIdentity): Promise<readonly DomainRecord[]> { return this.administration().listDomains(identity); }
+  getSettings(identity: AdminIdentity): Promise<RepositorySettings> { return this.administration().getSettings(identity); }
+  listApiTokens(identity: AdminIdentity): Promise<readonly import("./repository").ApiTokenRecord[]> { return this.administration().listApiTokens(identity); }
+
   revealPassword(identity: AdminIdentity, publicId: string): Promise<{ password: string; requestId: string }> {
     return this.administration().revealPassword(identity, publicId);
   }

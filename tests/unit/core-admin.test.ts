@@ -117,6 +117,19 @@ async function expectAdminError(promise: Promise<unknown>, code: string): Promis
 }
 
 describe("AdministrationService configuration and tokens", () => {
+  it("returns domains, settings, and token metadata without secret values", async () => {
+    const repository = new Repository(env.DB);
+    await repository.syncDomains([DOMAIN], NOW);
+    const service = adminService();
+    const created = await service.createApiToken(ADMIN, "Phone");
+
+    expect(await service.listDomains(ADMIN)).toEqual([{ domain: DOMAIN, active: true, syncedAt: NOW }]);
+    expect(await service.getSettings(ADMIN)).toMatchObject({ mailboxQuotaMb: 100, prefixLength: 12 });
+    const tokens = await service.listApiTokens(ADMIN);
+    expect(tokens).toEqual([{ id: created.id, name: "Phone", createdAt: NOW, lastUsedAt: null, revokedAt: null }]);
+    expect(JSON.stringify(tokens)).not.toContain(created.rawToken);
+  });
+
   it("syncs domains without deleting missing rows and leaves state unchanged on upstream failure", async () => {
     const repository = new Repository(env.DB);
     await repository.syncDomains([DOMAIN, SECOND_DOMAIN], STALE);

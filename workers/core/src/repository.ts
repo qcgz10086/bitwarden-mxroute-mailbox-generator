@@ -727,6 +727,13 @@ export class Repository {
     return Number(row?.count ?? 0);
   }
 
+  async listTokens(): Promise<readonly ApiTokenRecord[]> {
+    const result = await this.db.prepare(`SELECT id, name, created_at, last_used_at, revoked_at
+      FROM api_tokens ORDER BY created_at DESC, id DESC`).all<TokenRow>();
+    return result.results.map((row) => ({ id: row.id, name: row.name, createdAt: row.created_at,
+      lastUsedAt: row.last_used_at, revokedAt: row.revoked_at }));
+  }
+
   async revokeToken(id: string, revokedAt: string): Promise<void> {
     const result = await this.db.prepare(`UPDATE api_tokens SET revoked_at = ?
       WHERE id = ? AND revoked_at IS NULL`).bind(revokedAt, id).run();

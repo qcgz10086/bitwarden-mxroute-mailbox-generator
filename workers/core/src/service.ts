@@ -314,6 +314,21 @@ export class AdministrationService {
     catch (error) { throw new AdminError(repositoryAdminCode(error), this.createId("request")); }
   }
 
+  async listDomains(_identity: AdminIdentity): Promise<readonly import("./repository").DomainRecord[]> {
+    try { return await this.dependencies.repository.listDomains(); }
+    catch { throw new AdminError("INTERNAL_ERROR", this.createId("request")); }
+  }
+
+  async getSettings(_identity: AdminIdentity): Promise<RepositorySettings> {
+    try { return await this.dependencies.repository.getSettings(); }
+    catch { throw new AdminError("INTERNAL_ERROR", this.createId("request")); }
+  }
+
+  async listApiTokens(_identity: AdminIdentity): Promise<readonly ApiTokenRecord[]> {
+    try { return await this.dependencies.repository.listTokens(); }
+    catch { throw new AdminError("INTERNAL_ERROR", this.createId("request")); }
+  }
+
   async revealPassword(identity: AdminIdentity, publicId: string): Promise<{ password: string; requestId: string }> {
     const requestId = this.createId("request");
     const mailbox = await this.dependencies.repository.findRevealableMailbox(publicId);
