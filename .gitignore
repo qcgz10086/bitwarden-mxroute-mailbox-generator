@@ -1,0 +1,8 @@
+.worktrees/
+.superpowers/
+work/
+node_modules/
+.wrangler/
+.dev.vars*
+dist/
+coverage/
