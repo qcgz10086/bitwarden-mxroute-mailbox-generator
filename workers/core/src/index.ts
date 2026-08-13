@@ -112,7 +112,13 @@ export class CoreService extends WorkerEntrypoint<CoreEnv> {
 
   private mxrouteDependencies(): import("./mxroute").MxrouteClientDependencies {
     return this.env.MXROUTE_FETCH === undefined ? {} : {
-      fetch: (input, init) => this.env.MXROUTE_FETCH!.fetch(input, init),
+      fetch: async (input, init) => {
+        const response = await this.env.MXROUTE_FETCH!.fetch(input, init);
+        if (response.headers.get("X-Integration-Fault") === "timeout") {
+          throw new DOMException("injected timeout", "AbortError");
+        }
+        return response;
+      },
     };
   }
 }

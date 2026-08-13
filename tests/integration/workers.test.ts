@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness, type TestHarness } from "wrangler";
 import { accessFixture } from "../fixtures/access-key";
 import type { CoreEnv } from "../../workers/core/src/index";
@@ -15,7 +15,11 @@ describe.sequential("three Worker integration", () => {
   let core: ReturnType<TestHarness["getWorker"]>;
   let generator: ReturnType<TestHarness["getWorker"]>;
   let admin: ReturnType<TestHarness["getWorker"]>;
-  let mx: { setMode(mode: MxMode): Promise<void>; getWrites(): Promise<Array<{ method: string; path: string; body: Record<string, unknown> }>> };
+  let mx: {
+    reset(): Promise<void>;
+    setMode(mode: MxMode): Promise<void>;
+    getWrites(): Promise<Array<{ method: string; path: string; body: Record<string, unknown> }>>;
+  };
   let db: D1Database;
   let issueAccess: Awaited<ReturnType<typeof accessFixture>>["issue"];
   let jwks: Awaited<ReturnType<typeof accessFixture>>["jwks"];
@@ -74,6 +78,16 @@ describe.sequential("three Worker integration", () => {
     await server?.close();
   });
 
+  beforeEach(async () => {
+    await mx.reset();
+    await db.prepare("DROP TRIGGER IF EXISTS integration_fail_activation").run();
+    await db.batch([
+      db.prepare("DELETE FROM mailboxes"),
+      db.prepare("DELETE FROM creation_counters"),
+      db.prepare("UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,'2026-08-13T00:00:00.000Z')"),
+    ]);
+  });
+
   it("creates through Generator, keeps plaintext out of D1, and completes the Access plus CSRF Admin lifecycle", async () => {
     const { rawToken } = await createToken("bitwarden-primary");
     const response = await generate(rawToken);
@@ -129,7 +143,9 @@ describe.sequential("three Worker integration", () => {
     const rpc = await core.getExport() as unknown as { revokeApiToken(identity: typeof ADMIN, id: string): Promise<unknown> };
     await rpc.revokeApiToken(ADMIN, created.id);
     expect((await generate(created.rawToken)).status).toBe(401);
-    const forged = `${await issueAccess()}.forged`;
+    const attacker = await accessFixture();
+    const forged = await attacker.issue();
+    expect(forged.split(".")).toHaveLength(3);
     const response = await admin.fetch("/api/mailboxes", { headers: { "Cf-Access-Jwt-Assertion": forged } });
     expect(response.status).toBe(401);
     expect(await response.json()).toEqual({ error: "UNAUTHORIZED" });
@@ -154,7 +170,12 @@ describe.sequential("three Worker integration", () => {
     await core.scheduled({ cron: "*/5 * * * *", scheduledTime: new Date() });
     await core.scheduled({ cron: "*/5 * * * *", scheduledTime: new Date() });
     expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(pending!.public_id).first("status")).toBe("active");
+    expect(await db.prepare("SELECT encryption_key_version FROM mailboxes WHERE public_id=?").bind(pending!.public_id).first("encryption_key_version")).toBe(1);
     await assertRecoverablePasswords();
+    const { csrfToken, cookie } = await csrf();
+    const revealed = await adminMutation(`/api/mailboxes/${pending!.public_id}/reveal`, "POST", {}, csrfToken, cookie);
+    expect(revealed.status).toBe(200);
+    expect((await revealed.json() as { password: string }).password).toBe(upstreamPassword);
     await revokeTokenByRawName("activation-failure");
   });
 
@@ -167,6 +188,7 @@ describe.sequential("three Worker integration", () => {
     const createdPassword = String((await lastWrite("POST"))?.body.password ?? "");
     expect(createdPassword).toHaveLength(18);
     expect(createTimeoutBody).not.toContain(createdPassword);
+    expect(JSON.parse(createTimeoutBody)).toEqual({ error: "Mailbox service temporarily unavailable" });
     await expectNoPlaintext(createdPassword);
     const pending = await db.prepare("SELECT public_id,email FROM mailboxes WHERE status='pending' ORDER BY id DESC LIMIT 1")
       .first<{ public_id: string; email: string }>();
@@ -176,24 +198,37 @@ describe.sequential("three Worker integration", () => {
     expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(pending!.public_id).first("status")).toBe("active");
 
     const { csrfToken, cookie } = await csrf();
+    const oldReveal = await adminMutation(`/api/mailboxes/${pending!.public_id}/reveal`, "POST", {}, csrfToken, cookie);
+    expect((await oldReveal.json() as { password: string }).password).toBe(createdPassword);
     await setMxMode("reset-timeout");
     const reset = await adminMutation(`/api/mailboxes/${pending!.public_id}/reset`, "POST", {}, csrfToken, cookie);
     expect(reset.status).toBe(503);
     const resetBody = await reset.text();
     const candidatePassword = String((await lastWrite("PATCH"))?.body.password ?? "");
     expect(candidatePassword).toHaveLength(18);
+    expect(candidatePassword).not.toBe(createdPassword);
     expect(resetBody).not.toContain(candidatePassword);
     await expectNoPlaintext(candidatePassword);
     expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(pending!.public_id).first("status")).toBe("reset_unknown");
+    expect(JSON.parse(resetBody)).toMatchObject({ error: "MX_TIMEOUT" });
+    const resetUnknown = await db.prepare(`SELECT failure_code,encryption_key_version,next_password_key_version
+      FROM mailboxes WHERE public_id=?`).bind(pending!.public_id).first<{
+        failure_code: string; encryption_key_version: number; next_password_key_version: number;
+      }>();
+    expect(resetUnknown).toMatchObject({ failure_code: "MX_TIMEOUT", encryption_key_version: 1, next_password_key_version: 1 });
     await assertRecoverablePasswords();
     await db.prepare("UPDATE mailboxes SET updated_at='2000-01-01T00:00:00.000Z',recovery_next_at=NULL WHERE public_id=?").bind(pending!.public_id).run();
     await setMxMode("ok");
     await core.scheduled({ cron: "*/5 * * * *", scheduledTime: new Date() });
     expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(pending!.public_id).first("status")).toBe("active");
+    const recoveredReveal = await adminMutation(`/api/mailboxes/${pending!.public_id}/reveal`, "POST", {}, csrfToken, cookie);
+    expect((await recoveredReveal.json() as { password: string }).password).toBe(candidatePassword);
+    expect(await db.prepare("SELECT encryption_key_version FROM mailboxes WHERE public_id=?").bind(pending!.public_id).first("encryption_key_version")).toBe(1);
 
     await setMxMode("delete-timeout");
     const deleted = await adminMutation(`/api/mailboxes/${pending!.public_id}`, "DELETE", { confirmationEmail: pending!.email }, csrfToken, cookie);
     expect(deleted.status).toBe(200);
+    expect((await lastWrite("DELETE"))?.path).toContain(pending!.email.split("@")[0]!);
     expect(await db.prepare("SELECT COUNT(*) count FROM mailboxes WHERE public_id=?").bind(pending!.public_id).first("count")).toBe(0);
     await setMxMode("ok");
     await assertRecoverablePasswords();
@@ -263,6 +298,8 @@ describe.sequential("three Worker integration", () => {
       hex(password_nonce) current_nonce, hex(next_password_ciphertext) next_ciphertext,
       hex(next_password_nonce) next_nonce FROM mailboxes`).all<Record<string, string>>();
     expect(JSON.stringify(blobs.results).toUpperCase()).not.toContain(passwordHex);
+    const tokenBlobs = await db.prepare("SELECT hex(token_hmac) token_hmac FROM api_tokens").all<Record<string, string>>();
+    expect(JSON.stringify(tokenBlobs.results).toUpperCase()).not.toContain(passwordHex);
   }
 
   async function assertRecoverablePasswords(): Promise<void> {

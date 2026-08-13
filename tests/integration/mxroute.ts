@@ -9,6 +9,11 @@ const mailboxes = new Map<string, Stored>();
 const writes: Recorded[] = [];
 
 export default class TestMxroute extends WorkerEntrypoint {
+  async reset(): Promise<void> {
+    mode = "ok";
+    mailboxes.clear();
+    writes.length = 0;
+  }
   async setMode(value: Mode): Promise<void> { mode = value; }
   async getWrites(): Promise<Recorded[]> { return structuredClone(writes); }
 
@@ -27,7 +32,7 @@ export default class TestMxroute extends WorkerEntrypoint {
       const username = String(body.username);
       const record = { password: String(body.password), quota: Number(body.quota), limit: Number(body.limit) };
       mailboxes.set(`${username}@${domain}`, record);
-      if (mode === "create-timeout") return new Response(null, { status: 504 });
+      if (mode === "create-timeout") return timeout();
       return mailbox(username, domain, record);
     }
     if (user === undefined) return new Response(null, { status: 404 });
@@ -37,12 +42,12 @@ export default class TestMxroute extends WorkerEntrypoint {
     if (request.method === "PATCH") {
       if (record === undefined) return new Response(null, { status: 404 });
       if (typeof body.password === "string") record.password = body.password;
-      if (mode === "reset-timeout") return new Response(null, { status: 504 });
+      if (mode === "reset-timeout") return timeout();
       return mailbox(user, domain, record);
     }
     if (request.method === "DELETE") {
       mailboxes.delete(key);
-      if (mode === "delete-timeout") return new Response(null, { status: 504 });
+      if (mode === "delete-timeout") return timeout();
       return new Response(null, { status: 204 });
     }
     return new Response(null, { status: 405 });
@@ -50,6 +55,7 @@ export default class TestMxroute extends WorkerEntrypoint {
 }
 
 function ok(data: unknown): Response { return Response.json({ success: true, data }); }
+function timeout(): Response { return new Response(null, { status: 599, headers: { "X-Integration-Fault": "timeout" } }); }
 function mailbox(user: string, domain: string, record: Stored): Response {
   return ok({ username: user, email: `${user}@${domain}`, quota: record.quota, limit: record.limit });
 }
