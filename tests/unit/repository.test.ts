@@ -457,4 +457,60 @@ describe("D1 repository", () => {
       created_at: NOW,
     });
   });
+
+  it("keeps a pending mailbox unchanged when its atomic activation audit fails", async () => {
+    const repository = new Repository(env.DB);
+    await prepareReservation(repository);
+    await repository.reservePendingMailbox(mailboxInput());
+    const audit = {
+      id: "audit_01",
+      actorType: "api_token",
+      actorId: TOKEN_ID,
+      action: "mailbox.create",
+      email: `alpha@${DOMAIN}`,
+      result: "success",
+      errorCode: null,
+      requestId: "request_01",
+      createdAt: LATER,
+    };
+    await repository.appendAudit(audit);
+
+    await expect(repository.activateMailboxWithAudit("mbx_01", LATER, audit)).rejects.toThrow();
+
+    expect(await repository.findMailbox("mbx_01")).toMatchObject({
+      status: "pending",
+      updatedAt: NOW,
+      failureCode: null,
+    });
+    const counter = await env.DB.prepare(
+      "SELECT count FROM creation_counters WHERE date = ? AND token_id = ?",
+    ).bind(DATE, TOKEN_ID).first<{ count: number }>();
+    expect(counter?.count).toBe(1);
+    const audits = await env.DB.prepare("SELECT COUNT(*) AS count FROM audit_events")
+      .first<{ count: number }>();
+    expect(audits?.count).toBe(1);
+  });
+
+  it("does not append an activation audit when the mailbox is no longer pending", async () => {
+    const repository = new Repository(env.DB);
+    await prepareReservation(repository);
+    await repository.reservePendingMailbox(mailboxInput());
+    await repository.transitionMailbox("mbx_01", "pending", "active", { updatedAt: LATER });
+
+    await expect(repository.activateMailboxWithAudit("mbx_01", LATER, {
+      id: "audit_stale",
+      actorType: "api_token",
+      actorId: TOKEN_ID,
+      action: "mailbox.create",
+      email: `alpha@${DOMAIN}`,
+      result: "success",
+      errorCode: null,
+      requestId: "request_stale",
+      createdAt: LATER,
+    })).rejects.toMatchObject({ code: "INVALID_STATE" });
+
+    const audit = await env.DB.prepare("SELECT id FROM audit_events WHERE id = ?")
+      .bind("audit_stale").first<{ id: string }>();
+    expect(audit).toBeNull();
+  });
 });

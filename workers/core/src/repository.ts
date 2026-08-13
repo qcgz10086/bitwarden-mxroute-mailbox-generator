@@ -275,6 +275,26 @@ export class Repository {
     requireSingleChange(result);
   }
 
+  async activateMailboxWithAudit(
+    publicId: string,
+    updatedAt: string,
+    event: AuditEventInput,
+  ): Promise<void> {
+    const [activation, audit] = await this.db.batch([
+      this.db.prepare(`UPDATE mailboxes
+        SET status = 'active',
+            failure_code = NULL,
+            updated_at = ?,
+            reservation_date = NULL,
+            reservation_token_id = NULL
+        WHERE public_id = ? AND status = 'pending'`)
+        .bind(updatedAt, publicId),
+      auditStatement(this.db, event, true),
+    ]);
+    requireSingleChange(activation);
+    requireSingleChange(audit);
+  }
+
   async failPendingMailbox(
     publicId: string,
     failureCode: string,
@@ -502,7 +522,16 @@ export class Repository {
   }
 
   async appendAudit(event: AuditEventInput): Promise<void> {
-    await this.db.prepare(`INSERT INTO audit_events(
+    await auditStatement(this.db, event).run();
+  }
+}
+
+function auditStatement(
+  db: D1Database,
+  event: AuditEventInput,
+  requirePreviousChange = false,
+): D1PreparedStatement {
+  return db.prepare(`INSERT INTO audit_events(
       id,
       actor_type,
       actor_id,
@@ -512,20 +541,19 @@ export class Repository {
       error_code,
       request_id,
       created_at
-    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .bind(
-        event.id,
-        event.actorType,
-        event.actorId,
-        event.action,
-        event.email,
-        event.result,
-        event.errorCode,
-        event.requestId,
-        event.createdAt,
-      )
-      .run();
-  }
+    ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE ${requirePreviousChange ? "changes() = 1" : "1 = 1"}`)
+    .bind(
+      event.id,
+      event.actorType,
+      event.actorId,
+      event.action,
+      event.email,
+      event.result,
+      event.errorCode,
+      event.requestId,
+      event.createdAt,
+    );
 }
 
 function mapMailbox(row: MailboxRow): MailboxRecord {
@@ -580,8 +608,8 @@ function fromBlob(value: unknown): Uint8Array {
   throw new RepositoryError("INVALID_STATE");
 }
 
-function requireSingleChange(result: D1Result<unknown>): void {
-  if (Number(result.meta.changes ?? 0) !== 1) {
+function requireSingleChange(result: D1Result<unknown> | undefined): void {
+  if (Number(result?.meta.changes ?? 0) !== 1) {
     throw new RepositoryError("INVALID_STATE");
   }
 }

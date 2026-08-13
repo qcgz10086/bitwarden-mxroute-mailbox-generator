@@ -218,7 +218,9 @@ function serviceErrorForStatus(status: number): ServiceError {
         ? "MX_CONFLICT"
         : status === 429
           ? "MX_RATE_LIMITED"
-          : "MX_SERVER";
+          : status >= 400 && status < 500
+            ? "MX_CLIENT"
+            : "MX_SERVER";
   return new ServiceError(code);
 }
 

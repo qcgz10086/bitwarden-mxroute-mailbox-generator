@@ -182,6 +182,15 @@ describe("MxrouteClient", () => {
     await expect(client.listDomains()).rejects.toMatchObject({ code, message: code });
   });
 
+  it.each([400, 403, 422])("normalizes explicit HTTP %i client failure to MX_CLIENT", async (status) => {
+    const client = clientWith(new Response("explicit client failure", { status }));
+
+    await expect(client.listDomains()).rejects.toMatchObject({
+      code: "MX_CLIENT",
+      message: "MX_CLIENT",
+    });
+  });
+
   it("normalizes a 10-second aborted fetch to a timeout", async () => {
     vi.useFakeTimers();
     const fetch: MxrouteFetch = async (_input, init) => new Promise<Response>((_resolve, reject) => {

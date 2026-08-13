@@ -19,6 +19,7 @@ import {
 } from "./repository";
 
 const MAX_CONFLICT_RETRIES = 5;
+const EXPECTED_MAILBOX_LIMIT = 9600;
 
 export type GenerationErrorCode =
   | "INVALID_TOKEN"
@@ -26,6 +27,7 @@ export type GenerationErrorCode =
   | "DEFAULT_DOMAIN_UNAVAILABLE"
   | "DAILY_LIMIT"
   | "TOTAL_LIMIT"
+  | "MX_CLIENT"
   | "MX_UNAUTHORIZED"
   | "MX_NOT_FOUND"
   | "MX_CONFLICT"
@@ -53,8 +55,7 @@ type GenerationRepository = Pick<Repository,
   | "getSettings"
   | "reservePendingMailbox"
   | "failPendingMailbox"
-  | "transitionMailbox"
-  | "appendAudit"
+  | "activateMailboxWithAudit"
 >;
 
 type GenerationMxroute = Pick<MxrouteClient, "createMailbox">;
@@ -160,12 +161,20 @@ export class MailboxService {
       }
 
       try {
-        await this.mxroute.createMailbox(
+        const created = await this.mxroute.createMailbox(
           domain,
           localPart,
           password,
           settings.mailboxQuotaMb,
         );
+        if (
+          created.username !== localPart
+          || created.email !== email
+          || created.quotaMb !== settings.mailboxQuotaMb
+          || created.limit !== EXPECTED_MAILBOX_LIMIT
+        ) {
+          throw new ServiceError("MX_INVALID_RESPONSE");
+        }
       } catch (error) {
         if (isUncertainUpstreamFailure(error)) {
           throw normalizeUpstream(error, requestId);
@@ -184,16 +193,7 @@ export class MailboxService {
       }
 
       try {
-        await this.repository.transitionMailbox(publicId, "pending", "active", {
-          updatedAt: now,
-          failureCode: null,
-        });
-      } catch {
-        throw generationError("INTERNAL_ERROR", requestId, 503, true);
-      }
-
-      try {
-        await this.repository.appendAudit({
+        await this.repository.activateMailboxWithAudit(publicId, now, {
           id: this.createId("audit"),
           actorType: "api_token",
           actorId: token.id,
@@ -205,7 +205,7 @@ export class MailboxService {
           createdAt: now,
         });
       } catch {
-        throw generationError("INTERNAL_ERROR", requestId);
+        throw generationError("INTERNAL_ERROR", requestId, 503, true);
       }
 
       return {
@@ -262,7 +262,7 @@ function statusFor(code: GenerationErrorCode): number {
   if (code === "DAILY_LIMIT" || code === "TOTAL_LIMIT") {
     return 429;
   }
-  if (code === "MX_UNAUTHORIZED" || code === "MX_NOT_FOUND") {
+  if (code === "MX_CLIENT" || code === "MX_UNAUTHORIZED" || code === "MX_NOT_FOUND") {
     return 502;
   }
   if (

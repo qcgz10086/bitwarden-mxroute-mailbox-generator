@@ -1,4 +1,5 @@
 export type ServiceErrorCode =
+  | "MX_CLIENT"
   | "MX_UNAUTHORIZED"
   | "MX_NOT_FOUND"
   | "MX_CONFLICT"

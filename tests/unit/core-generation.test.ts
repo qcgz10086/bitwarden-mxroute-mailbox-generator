@@ -32,11 +32,13 @@ interface CreateRequest {
   readonly quotaMb: number;
 }
 
+type FakeOutcome = ServiceErrorCode | "MX_CLIENT" | "success" | MxrouteMailbox;
+
 class FakeMxroute {
   readonly requests: CreateRequest[] = [];
-  private readonly outcomes: (ServiceErrorCode | "success")[];
+  private readonly outcomes: FakeOutcome[];
 
-  constructor(...outcomes: (ServiceErrorCode | "success")[]) {
+  constructor(...outcomes: FakeOutcome[]) {
     this.outcomes = [...outcomes];
   }
 
@@ -48,8 +50,11 @@ class FakeMxroute {
   ): Promise<MxrouteMailbox> {
     this.requests.push({ domain, user, password, quotaMb });
     const outcome = this.outcomes.shift() ?? "success";
+    if (typeof outcome === "object") {
+      return outcome;
+    }
     if (outcome !== "success") {
-      throw new ServiceError(outcome);
+      throw new ServiceError(outcome as ServiceErrorCode);
     }
     return { username: user, email: `${user}@${domain}`, quotaMb, limit: 9600 };
   }
@@ -408,6 +413,54 @@ describe("MailboxService.generateMailbox", () => {
     expect(counter?.count).toBe(0);
   });
 
+  it.each([400, 403, 422])(
+    "fails and releases pending state for explicit HTTP %i client failure",
+    async () => {
+      const repository = new Repository(env.DB);
+      await prepareActiveConfiguration(repository);
+      const mxroute = new FakeMxroute("MX_CLIENT");
+
+      await expect(serviceWith(repository, mxroute).generateMailbox(TOKEN)).rejects.toMatchObject({
+        code: "MX_CLIENT",
+        status: 502,
+        retryable: false,
+      });
+      expect(await repository.findMailbox("mailbox-1")).toMatchObject({
+        status: "failed",
+        failureCode: "MX_CLIENT",
+      });
+      const counter = await env.DB.prepare(
+        "SELECT count FROM creation_counters WHERE date = ? AND token_id = ?",
+      ).bind("2026-08-13", TOKEN_ID).first<{ count: number }>();
+      expect(counter?.count).toBe(0);
+    },
+  );
+
+  it.each([
+    ["username", { username: "different", email: `23456789abcd@${DOMAIN}`, quotaMb: 100, limit: 9600 }],
+    ["email", { username: "23456789abcd", email: `different@${DOMAIN}`, quotaMb: 100, limit: 9600 }],
+    ["quota", { username: "23456789abcd", email: `23456789abcd@${DOMAIN}`, quotaMb: 250, limit: 9600 }],
+    ["limit", { username: "23456789abcd", email: `23456789abcd@${DOMAIN}`, quotaMb: 100, limit: 4800 }],
+  ] as const)("retains pending state when the create response mismatches %s", async (_field, response) => {
+    const repository = new Repository(env.DB);
+    await prepareActiveConfiguration(repository);
+    const mxroute = new FakeMxroute(response);
+
+    await expect(serviceWith(repository, mxroute).generateMailbox(TOKEN)).rejects.toMatchObject({
+      code: "MX_INVALID_RESPONSE",
+      status: 503,
+      retryable: true,
+    });
+    expect(await repository.findMailbox("mailbox-1")).toMatchObject({
+      status: "pending",
+      failureCode: null,
+    });
+    const counter = await env.DB.prepare(
+      "SELECT count FROM creation_counters WHERE date = ? AND token_id = ?",
+    ).bind("2026-08-13", TOKEN_ID).first<{ count: number }>();
+    expect(counter?.count).toBe(1);
+  });
+
   it.each([
     "MX_SERVER",
     "MX_TIMEOUT",
@@ -468,7 +521,7 @@ describe("MailboxService.generateMailbox", () => {
     const mxroute = new FakeMxroute("success");
     const failingRepository = new Proxy(repository, {
       get(target, property, receiver) {
-        if (property === "transitionMailbox") {
+        if (property === "activateMailboxWithAudit") {
           return async () => {
             throw new Error("injected D1 transition failure");
           };
