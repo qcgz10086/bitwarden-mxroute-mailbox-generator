@@ -317,6 +317,7 @@ describe("D1 repository", () => {
     await repository.saveNextPassword("mbx_01", {
       ciphertext: nextCiphertext,
       nonce: nextNonce,
+      keyVersion: 1,
       updatedAt: "2026-08-13T10:02:00.000Z",
     });
     expect(await repository.findMailbox("mbx_01")).toMatchObject({ status: "resetting" });
@@ -328,6 +329,7 @@ describe("D1 repository", () => {
     expect(Array.from(completed!.passwordNonce)).toEqual([12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
     expect(completed?.nextPasswordCiphertext).toBeNull();
     expect(completed?.nextPasswordNonce).toBeNull();
+    expect(completed?.nextPasswordKeyVersion).toBeNull();
   });
 
   it("pages mailboxes with a stable cursor and literal ordering", async () => {
@@ -449,6 +451,7 @@ describe("D1 repository", () => {
       id: "audit_01",
       actor_type: "admin",
       actor_id: "admin@example.test",
+      actor_email: null,
       action: "mailbox.reveal",
       email: `alpha@${DOMAIN}`,
       result: "success",

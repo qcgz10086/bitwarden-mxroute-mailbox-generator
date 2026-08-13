@@ -285,6 +285,7 @@ describe("MailboxService.generateMailbox", () => {
       id: "audit-01",
       actor_type: "api_token",
       actor_id: TOKEN_ID,
+      actor_email: null,
       action: "mailbox.create",
       email: `23456789abcd@${DOMAIN}`,
       result: "success",
