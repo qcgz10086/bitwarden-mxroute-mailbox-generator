@@ -135,6 +135,39 @@ describe("encrypted mailbox passwords", () => {
       decryptPassword(decryptInput(encrypted, PRIMARY_KEY, "support@example.test")),
     ).rejects.toThrow();
   });
+
+  it("rejects decryption when the public ID AAD changes", async () => {
+    const encrypted = await encryptPassword({
+      password: PLAINTEXT,
+      key: PRIMARY_KEY,
+      publicId: PUBLIC_ID,
+      email: EMAIL,
+      keyVersion: 1,
+    });
+
+    await expect(
+      decryptPassword({
+        encrypted,
+        key: PRIMARY_KEY,
+        publicId: "mbx_01J3Q6J6V6BX8JVNNPQ2P8G5U0",
+        email: EMAIL,
+      }),
+    ).rejects.toThrow();
+  });
+
+  it("rejects decryption when the key-version AAD changes", async () => {
+    const encrypted = await encryptPassword({
+      password: PLAINTEXT,
+      key: PRIMARY_KEY,
+      publicId: PUBLIC_ID,
+      email: EMAIL,
+      keyVersion: 1,
+    });
+
+    await expect(
+      decryptPassword(decryptInput({ ...encrypted, keyVersion: 2 })),
+    ).rejects.toThrow();
+  });
 });
 
 describe("API-token HMACs", () => {
