@@ -37,6 +37,22 @@ export function activeDomainNames(domains: readonly { domain: string; active: bo
 export async function runAction(action: () => void | Promise<void>, report: (error: unknown) => void): Promise<void> {
   try { await action(); } catch (error) { report(error); }
 }
+const disabledOperations = new WeakSet<object>();
+export async function runDisabled(control: { disabled: boolean }, action: () => void | Promise<void>): Promise<boolean> {
+  if (disabledOperations.has(control)) return false;
+  disabledOperations.add(control); control.disabled = true;
+  try { await action(); return true; } finally { disabledOperations.delete(control); control.disabled = false; }
+}
+export async function performExactDelete(
+  publicId: string,
+  email: string,
+  confirmation: string,
+  mutate: (path: string, method: "DELETE", body: object) => Promise<unknown>,
+  close: () => void,
+): Promise<boolean> {
+  if (!validateDeleteConfirmation(email, confirmation)) return false;
+  await mutate(`/api/mailboxes/${encodeURIComponent(publicId)}`, "DELETE", { confirmationEmail: confirmation }); close(); return true;
+}
 interface EventSource { addEventListener(name: string, listener: () => void): void; }
 export function bindSensitiveLifecycleEvents(
   sources: { visibility: EventSource; navigation: EventSource; tokenDialog: EventSource; isHidden: () => boolean },
@@ -115,6 +131,59 @@ export class SingleDisplaySecret {
   }
 }
 
+interface TokenWorkflowDependencies {
+  create(name: string): Promise<{ id: string; rawToken: string }>;
+  revoke(id: string): Promise<unknown>;
+  display(rawToken: string): void;
+  clear(): void;
+  report(code: "TOKEN_CREATE_FAILED" | "TOKEN_COMPENSATION_FAILED"): void;
+}
+export class TokenCreationWorkflow {
+  private contextActive = true;
+  private creating = false;
+  private generation = 0;
+  private rawToken: string | null = null;
+  private tokenId: string | null = null;
+  private saved = false;
+  private readonly revocations = new Map<string, Promise<void>>();
+  constructor(private readonly dependencies: TokenWorkflowDependencies) {}
+  busy(): boolean { return this.creating || this.rawToken !== null; }
+  async create(name: string): Promise<"displayed" | "revoked" | "failed" | "busy"> {
+    if (this.busy() || !this.contextActive) return "busy";
+    this.creating = true; const generation = ++this.generation;
+    try {
+      const result = await this.dependencies.create(name); this.creating = false;
+      if (this.contextActive && generation === this.generation && this.rawToken === null) {
+        this.rawToken = result.rawToken; this.tokenId = result.id; this.saved = false; this.dependencies.display(result.rawToken); return "displayed";
+      }
+      await this.revokeOnce(result.id); return "revoked";
+    } catch {
+      this.creating = false; if (this.contextActive && generation === this.generation) this.dependencies.report("TOKEN_CREATE_FAILED"); return "failed";
+    }
+  }
+  async copyTo(writeText: (value: string) => Promise<void>): Promise<boolean> {
+    const current = this.rawToken; if (current === null || !this.contextActive) return false;
+    await writeText(current); if (this.rawToken === current) this.saved = true; return true;
+  }
+  dismissSaved(): void { this.saved = true; this.clearDisplay(); }
+  closeWithoutSave(): void {
+    const id = this.tokenId; const shouldRevoke = id !== null && !this.saved;
+    this.clearDisplay(); if (shouldRevoke) void this.revokeOnce(id);
+  }
+  pagehide(): void {
+    this.contextActive = false; this.generation += 1;
+    const id = this.tokenId; const shouldRevoke = id !== null && !this.saved;
+    this.clearDisplay(); if (shouldRevoke) void this.revokeOnce(id);
+  }
+  async compensation(): Promise<void> { await Promise.all(this.revocations.values()); }
+  private clearDisplay(): void { this.rawToken = null; this.tokenId = null; this.saved = false; this.dependencies.clear(); }
+  private revokeOnce(id: string): Promise<void> {
+    const existing = this.revocations.get(id); if (existing) return existing;
+    const operation = this.dependencies.revoke(id).then(() => undefined).catch(() => { if (this.contextActive) this.dependencies.report("TOKEN_COMPENSATION_FAILED"); });
+    this.revocations.set(id, operation); return operation;
+  }
+}
+
 export interface SettingsInput { mailboxQuotaMb: number; dailyCreationLimit: number; totalManagedLimit: number; }
 export function validateSettingsInput(value: SettingsInput): string[] {
   const errors: string[] = [];
@@ -130,7 +199,9 @@ export class AdminApi {
   private csrfToken: string | null = null;
   constructor(private readonly fetcher: Fetcher = fetch as Fetcher) {}
   async initialize(): Promise<void> { const session = await this.request<{ csrfToken: string }>("/api/session", { method: "GET" }); this.csrfToken = session.csrfToken; }
-  get<T>(path: string): Promise<T> { return this.request<T>(path, { method: "GET" }); }
+  get<T>(path: string, signal?: AbortSignal): Promise<T> {
+    const init: BrowserRequestInit = { method: "GET" }; if (signal) init.signal = signal; return this.request<T>(path, init);
+  }
   mutate<T>(path: string, method: "POST" | "PUT" | "DELETE", body: object = {}, signal?: AbortSignal): Promise<T> {
     if (!this.csrfToken) throw new Error("Session is not initialized.");
     const init: BrowserRequestInit = { method, headers: { "Content-Type": "application/json", "X-CSRF-Token": this.csrfToken }, body: JSON.stringify(body) };
@@ -153,19 +224,37 @@ interface AuditRecord { id: string; actorType: string; actorId: string; actorEma
 
 export class RecoveryPager {
   private readonly pages = new Map<MailboxStatus, { items: MailboxSummary[]; cursor: string | null }>();
+  private generation = 0;
+  private refreshOperation: Promise<void> | null = null;
+  private readonly statusOperations = new Map<MailboxStatus, { controller: AbortController; operation: Promise<void> }>();
   constructor(
-    private readonly fetchPage: (status: MailboxStatus, cursor?: string) => Promise<MailboxPage>,
+    private readonly fetchPage: (status: MailboxStatus, cursor?: string, signal?: AbortSignal) => Promise<MailboxPage>,
     private readonly statuses: readonly MailboxStatus[],
   ) {}
-  async loadInitial(): Promise<void> { for (const status of this.statuses) await this.load(status, false); }
-  async loadMore(status: MailboxStatus): Promise<void> { if (this.pages.get(status)?.cursor) await this.load(status, true); }
+  loadInitial(): Promise<void> { return this.refresh(); }
+  refresh(): Promise<void> {
+    if (this.refreshOperation) return this.refreshOperation;
+    const generation = ++this.generation; for (const value of this.statusOperations.values()) value.controller.abort(); this.statusOperations.clear();
+    const operation = Promise.all(this.statuses.map(async (status) => {
+      const controller = new AbortController(); const page = await this.fetchPage(status, undefined, controller.signal); return { status, page };
+    })).then((results) => { if (generation === this.generation) for (const { status, page } of results) this.pages.set(status, { items: [...page.items], cursor: page.nextCursor }); }).finally(() => { if (this.refreshOperation === operation) this.refreshOperation = null; });
+    this.refreshOperation = operation; return operation;
+  }
+  loadMore(status: MailboxStatus): Promise<void> {
+    const active = this.statusOperations.get(status); if (active) return active.operation;
+    if (this.refreshOperation) return this.refreshOperation;
+    const previous = this.pages.get(status); if (!previous?.cursor) return Promise.resolve();
+    const generation = this.generation; const controller = new AbortController();
+    const operation = this.fetchPage(status, previous.cursor, controller.signal).then((page) => {
+      if (generation !== this.generation || controller.signal.aborted || this.statusOperations.get(status)?.operation !== operation) return;
+      this.pages.set(status, { items: [...previous.items, ...page.items], cursor: page.nextCursor });
+    }).finally(() => { if (this.statusOperations.get(status)?.operation === operation) this.statusOperations.delete(status); });
+    this.statusOperations.set(status, { controller, operation }); return operation;
+  }
   items(status: MailboxStatus): readonly MailboxSummary[] { return this.pages.get(status)?.items ?? []; }
   statusesWithMore(): MailboxStatus[] { return this.statuses.filter((status) => this.pages.get(status)?.cursor); }
-  private async load(status: MailboxStatus, append: boolean): Promise<void> {
-    const previous = this.pages.get(status); const cursor = append ? previous?.cursor ?? undefined : undefined;
-    const page = await this.fetchPage(status, cursor);
-    this.pages.set(status, { items: append ? [...(previous?.items ?? []), ...page.items] : [...page.items], cursor: page.nextCursor });
-  }
+  refreshBusy(): boolean { return this.refreshOperation !== null; }
+  statusBusy(status: MailboxStatus): boolean { return this.statusOperations.has(status); }
 }
 
 const byId = <T extends HTMLElement = HTMLElement>(id: string): T => document.getElementById(id) as T;
@@ -177,9 +266,9 @@ let domains: readonly Domain[] = [];
 const clearMailboxSecrets = new Set<() => void>();
 function concealAllMailboxSecrets(): void { for (const clear of clearMailboxSecrets) clear(); }
 const recoveryStatuses: readonly MailboxStatus[] = ["pending", "resetting", "reset_unknown", "deleting", "delete_failed", "failed"];
-const recoveryPager = new RecoveryPager(async (state, cursor) => {
+const recoveryPager = new RecoveryPager(async (state, cursor, signal) => {
   const params = new URLSearchParams({ limit: "100", status: state }); if (cursor) params.set("cursor", cursor);
-  return api.get<MailboxPage>(`/api/mailboxes?${params}`);
+  return api.get<MailboxPage>(`/api/mailboxes?${params}`, signal);
 }, recoveryStatuses);
 
 function cell(row: HTMLTableRowElement, value: unknown): HTMLTableCellElement { const node = row.insertCell(); text(node, value); return node; }
@@ -263,26 +352,32 @@ async function loadMoreRecovery(): Promise<void> {
 }
 
 function bind(): void {
-  const tokenGate = new SingleDisplaySecret(); const tokenButton = byId<HTMLButtonElement>("create-token");
+  const tokenButton = byId<HTMLButtonElement>("create-token"); const tokenDialog = byId<HTMLDialogElement>("token-dialog");
+  const tokenWorkflow = new TokenCreationWorkflow({
+    create: (name) => api.mutate<{ id: string; rawToken: string }>("/api/tokens", "POST", { name }),
+    revoke: (id) => api.mutate(`/api/tokens/${encodeURIComponent(id)}`, "DELETE"),
+    display: (rawToken) => { concealAllMailboxSecrets(); text(byId("raw-token"), rawToken); tokenDialog.showModal(); },
+    clear: () => { text(byId("raw-token"), ""); tokenButton.disabled = false; },
+    report: (code) => status(code === "TOKEN_CREATE_FAILED" ? "Token creation failed." : "Token could not be safely revoked; revoke it from the token list."),
+  });
   byId("mailbox-filter").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); void loadMailboxes().catch(fail); }); byId("mailbox-next").addEventListener("click", () => { if (mailboxCursor) void loadMailboxes(mailboxCursor).catch(fail); });
   byId("sync-domains").addEventListener("click", () => void api.mutate<readonly Domain[]>("/api/domains/sync", "POST").then(async () => { await loadDomains(); await loadSettings(); }).catch(fail));
   byId("default-domain-form").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); const domain = byId<HTMLSelectElement>("default-domain").value; if (!domains.some((item) => item.active && item.domain === domain)) return status("Choose an active domain."); void api.mutate("/api/domains/default", "PUT", { domain }).then(() => status("Default domain saved.")).catch(fail); });
   byId("settings-form").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); const value = { mailboxQuotaMb: Number(byId<HTMLInputElement>("quota").value), dailyCreationLimit: Number(byId<HTMLInputElement>("daily-limit").value), totalManagedLimit: Number(byId<HTMLInputElement>("total-limit").value) }; const errors = validateSettingsInput(value); if (errors.length) return status(errors.join(" ")); void api.mutate("/api/settings", "PUT", { ...value, generationEnabled: byId<HTMLInputElement>("generation-enabled").checked }).then(() => status("Settings saved.")).catch(fail); });
   byId("token-form").addEventListener("submit", (event: { preventDefault(): void }) => {
     event.preventDefault(); const name = byId<HTMLInputElement>("token-name").value.trim(); if (!name) return;
-    const ticket = tokenGate.begin(); if (!ticket) return status("Save or dismiss the current token before creating another."); tokenButton.disabled = true;
-    void api.mutate<{ rawToken: string }>("/api/tokens", "POST", { name }).then(async (result) => {
-      if (!ticket.accept(result.rawToken)) return;
-      concealAllMailboxSecrets(); text(byId("raw-token"), tokenGate.value()); byId<HTMLDialogElement>("token-dialog").showModal(); await loadTokens();
-    }).catch((error) => { ticket.cancel(); fail(error); }).finally(() => { tokenButton.disabled = tokenGate.busy(); });
+    if (tokenWorkflow.busy()) return status("Save or dismiss the current token before creating another."); tokenButton.disabled = true;
+    void tokenWorkflow.create(name).then(async (result) => { tokenButton.disabled = tokenWorkflow.busy(); if (result === "displayed" || result === "revoked") await loadTokens(); }).catch(fail);
   });
-  byId("copy-token").addEventListener("click", () => { void tokenGate.copyTo((value) => navigator.clipboard.writeText(value)).then((copied) => { if (copied) status("Token copied."); }).catch(fail); });
-  const clearToken = () => { tokenGate.close(); text(byId("raw-token"), ""); tokenButton.disabled = false; };
-  const tokenDialog = byId<HTMLDialogElement>("token-dialog");
-  byId("dismiss-token").addEventListener("click", () => { const dialog = byId<HTMLDialogElement>("token-dialog"); clearToken(); dialog.close(); });
-  byId("delete-form").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); const input = byId<HTMLInputElement>("delete-confirmation"); if (!validateDeleteConfirmation(input.dataset.email ?? "", input.value)) return status("Type the complete email address exactly."); void api.mutate(`/api/mailboxes/${encodeURIComponent(input.dataset.id ?? "")}`, "DELETE", { confirmationEmail: input.value }).then(async () => { byId<HTMLDialogElement>("delete-dialog").close(); await loadMailboxes(); await loadRecovery(); status("Mailbox permanently deleted."); }).catch(fail); });
-  byId("cancel-delete").addEventListener("click", () => byId<HTMLDialogElement>("delete-dialog").close()); byId("audit-next").addEventListener("click", () => { if (auditCursor) void loadAudit(auditCursor).catch(fail); }); byId("refresh-recovery").addEventListener("click", () => void loadRecovery().catch(fail)); byId("recovery-more").addEventListener("click", () => void loadMoreRecovery().catch(fail));
-  bindSensitiveLifecycleEvents({ visibility: document, navigation: window, tokenDialog, isHidden: () => document.hidden }, concealAllMailboxSecrets, clearToken);
+  byId("copy-token").addEventListener("click", () => { void tokenWorkflow.copyTo((value) => navigator.clipboard.writeText(value)).then((copied) => { if (copied) status("Token copied and marked as saved."); }).catch(fail); });
+  tokenDialog.addEventListener("close", () => tokenWorkflow.closeWithoutSave());
+  byId("dismiss-token").addEventListener("click", () => { tokenWorkflow.dismissSaved(); tokenDialog.close(); });
+  byId("delete-form").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); const input = byId<HTMLInputElement>("delete-confirmation"); void performExactDelete(input.dataset.id ?? "", input.dataset.email ?? "", input.value, (path, method, body) => api.mutate(path, method, body), () => byId<HTMLDialogElement>("delete-dialog").close()).then(async (deleted) => { if (!deleted) return status("Type the complete email address exactly."); await loadMailboxes(); await loadRecovery(); status("Mailbox permanently deleted."); }).catch(fail); });
+  const refreshButton = byId<HTMLButtonElement>("refresh-recovery"); const moreButton = byId<HTMLButtonElement>("recovery-more");
+  byId("cancel-delete").addEventListener("click", () => byId<HTMLDialogElement>("delete-dialog").close()); byId("audit-next").addEventListener("click", () => { if (auditCursor) void loadAudit(auditCursor).catch(fail); });
+  refreshButton.addEventListener("click", () => void runDisabled(refreshButton, async () => { moreButton.disabled = true; await recoveryPager.refresh(); renderRecovery(); }).catch(fail));
+  moreButton.addEventListener("click", () => void runDisabled(moreButton, async () => { refreshButton.disabled = true; try { await loadMoreRecovery(); } finally { refreshButton.disabled = false; } }).then(() => renderRecovery()).catch(fail));
+  bindSensitiveLifecycleEvents({ visibility: document, navigation: window, tokenDialog: { addEventListener: () => undefined }, isHidden: () => document.hidden }, concealAllMailboxSecrets, () => { tokenWorkflow.pagehide(); void tokenWorkflow.compensation(); });
 }
 
 async function start(): Promise<void> { bind(); await api.initialize(); await loadDomains(); await Promise.all([loadMailboxes(), loadSettings(), loadTokens(), loadAudit(), loadRecovery()]); status("Management data loaded."); }

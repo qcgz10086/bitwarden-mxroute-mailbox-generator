@@ -1,14 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
-import type { MailboxSummary } from "../../packages/contracts/src/index";
+import type { MailboxPage, MailboxStatus, MailboxSummary } from "../../packages/contracts/src/index";
 import {
   AdminApi,
   RecoveryPager,
   SecretCellController,
   SingleDisplaySecret,
+  TokenCreationWorkflow,
   activeDomainNames,
   bindSensitiveLifecycleEvents,
   formatMailboxRow,
   runAction,
+  performExactDelete,
+  runDisabled,
   text,
   validateDeleteConfirmation,
   validateSettingsInput,
@@ -97,6 +100,15 @@ describe("AdminApi", () => {
     await expect(api.get("https://evil.example/steal")).rejects.toThrow("Only same-origin API paths are allowed.");
     expect(fetcher).not.toHaveBeenCalled();
   });
+
+  it("forwards an AbortSignal from a secret operation to fetch", async () => {
+    const fetcher = vi.fn(async (path: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify(path === "/api/session" ? { csrfToken: "csrf" } : { password: "secret" })));
+    const api = new AdminApi(fetcher); await api.initialize(); const controller = new AbortController();
+    await api.mutate("/api/mailboxes/m1/reveal", "POST", {}, controller.signal);
+    expect(fetcher.mock.calls[1]?.[1]?.signal).toBe(controller.signal);
+    await api.get("/api/mailboxes?status=pending", controller.signal);
+    expect(fetcher.mock.calls[2]?.[1]?.signal).toBe(controller.signal);
+  });
 });
 
 function deferred<T>() {
@@ -176,10 +188,55 @@ describe("sensitive event workflows", () => {
     expect(gate.begin()).not.toBeNull();
   });
 
+  it("compensates exactly once when pagehide wins the race with successful token creation", async () => {
+    const creation = deferred<{ id: string; rawToken: string }>();
+    const create = vi.fn(() => creation.promise); const revoke = vi.fn(async () => undefined); const display = vi.fn(); const clear = vi.fn();
+    const workflow = new TokenCreationWorkflow({ create, revoke, display, clear, report: vi.fn() });
+    const pending = workflow.create("phone"); workflow.pagehide();
+    creation.resolve({ id: "token-1", rawToken: "one-time-raw" });
+    await expect(pending).resolves.toBe("revoked");
+    expect(create).toHaveBeenCalledTimes(1); expect(revoke).toHaveBeenCalledExactlyOnceWith("token-1");
+    expect(display).not.toHaveBeenCalled(); expect(JSON.stringify(revoke.mock.calls)).not.toContain("one-time-raw");
+  });
+
+  it("revokes an unsaved displayed token on pagehide but retains a successfully copied token", async () => {
+    const revoke = vi.fn(async () => undefined); const display = vi.fn();
+    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t1", rawToken: "raw1" })), revoke, display, clear: vi.fn(), report: vi.fn() });
+    await expect(workflow.create("first")).resolves.toBe("displayed"); workflow.pagehide(); await workflow.compensation();
+    expect(revoke).toHaveBeenCalledExactlyOnceWith("t1");
+
+    const secondRevoke = vi.fn(async () => undefined); const copied = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t2", rawToken: "raw2" })), revoke: secondRevoke, display: vi.fn(), clear: vi.fn(), report: vi.fn() });
+    await copied.create("second"); await copied.copyTo(async () => undefined); copied.pagehide(); await copied.compensation();
+    expect(secondRevoke).not.toHaveBeenCalled();
+  });
+
+  it("keeps compensation failures secret-free and reports only while context remains", async () => {
+    const report = vi.fn(); const display = vi.fn();
+    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t1", rawToken: "never-log-this" })), revoke: vi.fn(async () => { throw new Error("upstream leaked body"); }), display, clear: vi.fn(), report });
+    await workflow.create("x"); workflow.pagehide(); await workflow.compensation();
+    expect(display).toHaveBeenCalledTimes(1); expect(report).not.toHaveBeenCalled();
+    expect(JSON.stringify(report.mock.calls)).not.toContain("never-log-this");
+  });
+
   it("filters default-domain choices to active domains and keeps exact delete semantics", () => {
     expect(activeDomainNames([{ domain: "active.example", active: true }, { domain: "old.example", active: false }])).toEqual(["active.example"]);
     expect(validateDeleteConfirmation("victim@example.com", "victim@example.com")).toBe(true);
     expect(validateDeleteConfirmation("victim@example.com", " victim@example.com")).toBe(false);
+  });
+
+  it("wires exact delete body and closes the dialog only after success", async () => {
+    const mutate = vi.fn(async () => ({ requestId: "r" })); const close = vi.fn();
+    await expect(performExactDelete("m1", "mail@example.com", "wrong@example.com", mutate, close)).resolves.toBe(false);
+    expect(mutate).not.toHaveBeenCalled(); expect(close).not.toHaveBeenCalled();
+    await expect(performExactDelete("m1", "mail@example.com", "mail@example.com", mutate, close)).resolves.toBe(true);
+    expect(mutate).toHaveBeenCalledWith("/api/mailboxes/m1", "DELETE", { confirmationEmail: "mail@example.com" }); expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables a real event control for the duration and ignores rapid re-entry", async () => {
+    const button = { disabled: false }; const operation = deferred<void>(); const action = vi.fn(() => operation.promise);
+    const first = runDisabled(button, action); const second = runDisabled(button, action);
+    expect(button.disabled).toBe(true); await expect(second).resolves.toBe(false); expect(action).toHaveBeenCalledTimes(1);
+    operation.resolve(); await expect(first).resolves.toBe(true); expect(button.disabled).toBe(false);
   });
 });
 
@@ -196,6 +253,29 @@ describe("recovery pagination", () => {
     await pager.loadMore("pending");
     expect(pager.items("pending")).toHaveLength(2); expect(pager.statusesWithMore()).toEqual(["delete_failed"]);
     expect(calls).toEqual(["pending:first", "delete_failed:first", "pending:pending-next"]);
+  });
+
+  it("deduplicates rapid load-more and ignores a late page invalidated by refresh", async () => {
+    const late = deferred<MailboxPage>(); let initial = 0; let staleSignal: AbortSignal | undefined;
+    const fetchPage = vi.fn(async (status: MailboxStatus, cursor?: string, signal?: AbortSignal): Promise<MailboxPage> => {
+      if (cursor) { staleSignal = signal; return late.promise; }
+      initial += 1; return { items: [{ ...mailbox, publicId: `${status}-${initial}`, status }], nextCursor: initial === 1 ? "old-next" : null };
+    });
+    const pager = new RecoveryPager(fetchPage, ["pending"]); await pager.refresh();
+    const more1 = pager.loadMore("pending"); const more2 = pager.loadMore("pending");
+    expect(fetchPage).toHaveBeenCalledTimes(2); expect(pager.statusBusy("pending")).toBe(true);
+    const refresh = pager.refresh(); expect(pager.refreshBusy()).toBe(true);
+    expect(staleSignal?.aborted).toBe(true);
+    late.resolve({ items: [{ ...mailbox, publicId: "stale", status: "pending" }], nextCursor: null });
+    await Promise.all([more1, more2, refresh]);
+    expect(pager.items("pending").map((item) => item.publicId)).not.toContain("stale");
+    expect(fetchPage).toHaveBeenCalledTimes(3);
+  });
+
+  it("deduplicates rapid refresh calls", async () => {
+    const page = deferred<MailboxPage>(); const fetchPage = vi.fn(() => page.promise); const pager = new RecoveryPager(fetchPage, ["pending"]);
+    const first = pager.refresh(); const second = pager.refresh(); expect(fetchPage).toHaveBeenCalledTimes(1);
+    page.resolve({ items: [], nextCursor: null }); await Promise.all([first, second]); expect(pager.refreshBusy()).toBe(false);
   });
 });
 
