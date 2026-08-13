@@ -27,8 +27,8 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await env.DB.batch([
-    env.DB.prepare("DELETE FROM creation_counters"),
     env.DB.prepare("DELETE FROM mailboxes"),
+    env.DB.prepare("DELETE FROM creation_counters"),
     env.DB.prepare("DELETE FROM api_tokens"),
     env.DB.prepare("DELETE FROM audit_events"),
     env.DB.prepare("DELETE FROM domains"),
@@ -170,10 +170,7 @@ describe("D1 repository", () => {
 
     await repository.transitionMailbox("mbx_01", "pending", "active", { updatedAt: LATER });
     await expect(
-      repository.transitionMailbox("mbx_01", "pending", "failed", {
-        failureCode: "UPSTREAM_ERROR",
-        updatedAt: LATER,
-      }),
+      repository.transitionMailbox("mbx_01", "pending", "active", { updatedAt: LATER }),
     ).rejects.toMatchObject({ code: "INVALID_STATE" });
     await expect(
       repository.transitionMailbox("mbx_01", "active", "pending", { updatedAt: LATER }),
@@ -185,36 +182,128 @@ describe("D1 repository", () => {
     });
   });
 
-  it("releases the exact daily reservation after a pending mailbox fails", async () => {
+  it("releases only the reservation ownership persisted on the pending mailbox", async () => {
     const repository = new Repository(env.DB);
     await prepareReservation(repository);
     await repository.reservePendingMailbox(mailboxInput());
-
-    await repository.transitionMailbox("mbx_01", "pending", "failed", {
-      failureCode: "UPSTREAM_CONFLICT",
-      updatedAt: LATER,
-      releaseReservation: { date: DATE, tokenId: TOKEN_ID },
+    await repository.createTokenDigest({
+      id: "token-secondary",
+      name: "Secondary",
+      digest: new Uint8Array([2, 7, 1, 8]),
+      createdAt: NOW,
     });
-
-    const counter = await env.DB.prepare(
-      "SELECT count FROM creation_counters WHERE date = ? AND token_id = ?",
-    ).bind(DATE, TOKEN_ID).first<{ count: number }>();
-    expect(counter?.count).toBe(0);
-
     await repository.reservePendingMailbox(mailboxInput({
+      tokenId: "token-secondary",
+      date: "2026-08-14",
       publicId: "mbx_02",
       email: `beta@${DOMAIN}`,
       localPart: "beta",
     }));
 
-    await expect(repository.transitionMailbox("mbx_01", "pending", "failed", {
-      updatedAt: "2026-08-13T10:02:00.000Z",
-      releaseReservation: { date: DATE, tokenId: TOKEN_ID },
-    })).rejects.toMatchObject({ code: "INVALID_STATE" });
+    await repository.failPendingMailbox("mbx_01", "UPSTREAM_CONFLICT", LATER);
+
+    const counters = await env.DB.prepare(`SELECT date, token_id, count
+      FROM creation_counters ORDER BY date, token_id`)
+      .all<{ date: string; token_id: string; count: number }>();
+    expect(counters.results).toEqual([
+      { date: DATE, token_id: TOKEN_ID, count: 0 },
+      { date: "2026-08-14", token_id: "token-secondary", count: 1 },
+    ]);
+  });
+
+  it("prevents retargeting reservation ownership while a mailbox is pending", async () => {
+    const repository = new Repository(env.DB);
+    await prepareReservation(repository);
+    await repository.createTokenDigest({
+      id: "token-secondary",
+      name: "Secondary",
+      digest: new Uint8Array([2, 7, 1, 8]),
+      createdAt: NOW,
+    });
+    await repository.reservePendingMailbox(mailboxInput());
+    await repository.reservePendingMailbox(mailboxInput({
+      tokenId: "token-secondary",
+      date: "2026-08-14",
+      publicId: "mbx_02",
+      email: `beta@${DOMAIN}`,
+      localPart: "beta",
+    }));
+
+    await expect(env.DB.prepare(`UPDATE mailboxes
+      SET reservation_date = ?, reservation_token_id = ?
+      WHERE public_id = ?`)
+      .bind("2026-08-14", "token-secondary", "mbx_01")
+      .run()).rejects.toThrow("RESERVATION_OWNERSHIP");
+  });
+
+  it("rejects failure release outside pending state without decrementing", async () => {
+    const repository = new Repository(env.DB);
+    await prepareReservation(repository);
+    await repository.reservePendingMailbox(mailboxInput());
+    await repository.transitionMailbox("mbx_01", "pending", "active", { updatedAt: LATER });
+
+    await expect(repository.failPendingMailbox(
+      "mbx_01",
+      "UPSTREAM_CONFLICT",
+      "2026-08-13T10:02:00.000Z",
+    )).rejects.toMatchObject({ code: "INVALID_STATE" });
+
+    const counter = await env.DB.prepare(
+      "SELECT count FROM creation_counters WHERE date = ? AND token_id = ?",
+    ).bind(DATE, TOKEN_ID).first<{ count: number }>();
+    expect(counter?.count).toBe(1);
+    expect(await repository.findMailbox("mbx_01")).toMatchObject({ status: "active" });
+  });
+
+  it("rolls back failure transition when its persisted counter is missing", async () => {
+    const repository = new Repository(env.DB);
+    await prepareReservation(repository);
+    await repository.reservePendingMailbox(mailboxInput());
+    await env.DB.prepare("DELETE FROM creation_counters WHERE date = ? AND token_id = ?")
+      .bind(DATE, TOKEN_ID).run();
+
+    await expect(repository.failPendingMailbox("mbx_01", "UPSTREAM_CONFLICT", LATER))
+      .rejects.toMatchObject({ code: "RESERVATION_RELEASE" });
+
+    expect(await repository.findMailbox("mbx_01")).toMatchObject({
+      status: "pending",
+      failureCode: null,
+    });
+  });
+
+  it("decrements a pending reservation exactly once", async () => {
+    const repository = new Repository(env.DB);
+    await prepareReservation(repository);
+    await repository.reservePendingMailbox(mailboxInput());
+
+    await repository.failPendingMailbox("mbx_01", "UPSTREAM_CONFLICT", LATER);
+
+    const counter = await env.DB.prepare(
+      "SELECT count FROM creation_counters WHERE date = ? AND token_id = ?",
+    ).bind(DATE, TOKEN_ID).first<{ count: number }>();
+    expect(counter?.count).toBe(0);
+    expect(await repository.findMailbox("mbx_01")).toMatchObject({
+      status: "failed",
+      failureCode: "UPSTREAM_CONFLICT",
+    });
+  });
+
+  it("cannot release a failed mailbox reservation twice", async () => {
+    const repository = new Repository(env.DB);
+    await prepareReservation(repository);
+    await repository.reservePendingMailbox(mailboxInput());
+    await repository.failPendingMailbox("mbx_01", "UPSTREAM_CONFLICT", LATER);
+
+    await expect(repository.failPendingMailbox(
+      "mbx_01",
+      "UPSTREAM_CONFLICT",
+      "2026-08-13T10:02:00.000Z",
+    )).rejects.toMatchObject({ code: "INVALID_STATE" });
+
     const afterStaleTransition = await env.DB.prepare(
       "SELECT count FROM creation_counters WHERE date = ? AND token_id = ?",
     ).bind(DATE, TOKEN_ID).first<{ count: number }>();
-    expect(afterStaleTransition?.count).toBe(1);
+    expect(afterStaleTransition?.count).toBe(0);
   });
 
   it("keeps a candidate reset password recoverable until completion", async () => {

@@ -14,6 +14,7 @@ export class RepositoryError extends Error {
 export type RepositoryErrorCode =
   | "DAILY_LIMIT"
   | "TOTAL_LIMIT"
+  | "RESERVATION_RELEASE"
   | "EMAIL_EXISTS"
   | "PUBLIC_ID_EXISTS"
   | "TOKEN_EXISTS"
@@ -62,10 +63,6 @@ export interface MailboxTransitionPatch {
   readonly updatedAt: string;
   readonly failureCode?: string | null;
   readonly quotaMb?: number;
-  readonly releaseReservation?: {
-    readonly date: string;
-    readonly tokenId: string;
-  };
 }
 
 export interface NextPasswordPatch {
@@ -173,7 +170,7 @@ const MAILBOX_SORT_COLUMNS: Readonly<Record<MailboxSort, string>> = {
 };
 
 const ALLOWED_TRANSITIONS: Readonly<Record<MailboxStatus, readonly MailboxStatus[]>> = {
-  pending: ["active", "failed", "deleting"],
+  pending: ["active", "deleting"],
   active: ["resetting", "deleting"],
   failed: ["deleting"],
   resetting: ["active", "reset_unknown", "deleting"],
@@ -212,6 +209,8 @@ export class Repository {
             email,
             local_part,
             domain,
+            reservation_date,
+            reservation_token_id,
             password_ciphertext,
             password_nonce,
             encryption_key_version,
@@ -219,12 +218,14 @@ export class Repository {
             status,
             created_at,
             updated_at
-          ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`)
+          ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`)
           .bind(
             input.publicId,
             input.email,
             input.localPart,
             input.domain,
+            input.date,
+            input.tokenId,
             toArrayBuffer(input.password.ciphertext),
             toArrayBuffer(input.password.nonce),
             input.password.keyVersion,
@@ -262,24 +263,40 @@ export class Repository {
       assignments.push("quota_mb = ?");
       bindings.push(patch.quotaMb);
     }
+    if (fromStates.includes("pending")) {
+      assignments.push("reservation_date = NULL", "reservation_token_id = NULL");
+    }
     const placeholders = fromStates.map(() => "?").join(", ");
-    const transition = this.db.prepare(`UPDATE mailboxes
+    const result = await this.db.prepare(`UPDATE mailboxes
       SET ${assignments.join(", ")}
       WHERE public_id = ? AND status IN (${placeholders})`)
-      .bind(...bindings, publicId, ...fromStates);
-    if (patch.releaseReservation === undefined) {
-      requireSingleChange(await transition.run());
-      return;
-    }
+      .bind(...bindings, publicId, ...fromStates)
+      .run();
+    requireSingleChange(result);
+  }
 
-    const [result] = await this.db.batch([
-      transition,
-      this.db.prepare(`UPDATE creation_counters
-        SET count = count - 1
-        WHERE date = ? AND token_id = ? AND count > 0 AND changes() = 1`)
-        .bind(patch.releaseReservation.date, patch.releaseReservation.tokenId),
-    ]);
-    requireSingleChange(result!);
+  async failPendingMailbox(
+    publicId: string,
+    failureCode: string,
+    updatedAt: string,
+  ): Promise<void> {
+    try {
+      const row = await this.db.prepare(`UPDATE mailboxes
+        SET status = 'failed',
+            failure_code = ?,
+            updated_at = ?,
+            reservation_date = NULL,
+            reservation_token_id = NULL
+        WHERE public_id = ? AND status = 'pending'
+        RETURNING public_id`)
+        .bind(failureCode, updatedAt, publicId)
+        .first<{ public_id: string }>();
+      if (row === null) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+    } catch (error) {
+      throw normalizeDatabaseError(error);
+    }
   }
 
   async findMailbox(publicId: string): Promise<MailboxRecord | null> {
@@ -585,6 +602,9 @@ function normalizeDatabaseError(error: unknown): RepositoryError | unknown {
   }
   if (message.includes("TOTAL_LIMIT")) {
     return new RepositoryError("TOTAL_LIMIT");
+  }
+  if (message.includes("RESERVATION_RELEASE")) {
+    return new RepositoryError("RESERVATION_RELEASE");
   }
   if (message.includes("mailboxes.email")) {
     return new RepositoryError("EMAIL_EXISTS");
