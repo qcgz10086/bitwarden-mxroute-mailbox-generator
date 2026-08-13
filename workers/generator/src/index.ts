@@ -78,8 +78,17 @@ export default {
     }
 
     try {
-      const result = await env.CORE.generateMailbox(token);
-      return json(publicAlias(result.alias), 201, safeRequestId(result.requestId) ?? requestId);
+      const result: unknown = await env.CORE.generateMailbox(token);
+      if (!isObject(result)) {
+        return error("Mailbox service temporarily unavailable", 503, requestId);
+      }
+      const record = result as Record<string, unknown>;
+      const alias = publicAlias(record.alias);
+      const responseRequestId = safeRequestId(record.requestId) ?? requestId;
+      if (alias === null) {
+        return error("Mailbox service temporarily unavailable", 503, responseRequestId);
+      }
+      return json(alias, 201, responseRequestId);
     } catch (caught) {
       return mappedCoreError(caught, requestId);
     }
@@ -97,12 +106,26 @@ async function safeLimit(
   }
 }
 
-function publicAlias(alias: AliasResult): AliasResult {
+function publicAlias(alias: unknown): AliasResult | null {
+  if (!isObject(alias)) {
+    return null;
+  }
+  const record = alias as Record<string, unknown>;
+  if (
+    !Number.isSafeInteger(record.id)
+    || (record.id as number) < 0
+    || typeof record.email !== "string"
+    || !/^[^@\s]+@[^@\s]+$/.test(record.email)
+    || !Number.isSafeInteger(record.creation_timestamp)
+    || (record.creation_timestamp as number) < 0
+  ) {
+    return null;
+  }
   return {
-    id: alias.id,
-    email: alias.email,
+    id: record.id as number,
+    email: record.email,
     enabled: true,
-    creation_timestamp: alias.creation_timestamp,
+    creation_timestamp: record.creation_timestamp as number,
     name: null,
     note: null,
   };

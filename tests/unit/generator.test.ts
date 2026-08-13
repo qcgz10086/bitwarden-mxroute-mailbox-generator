@@ -117,6 +117,30 @@ describe("Generator Worker", () => {
     expect(JSON.stringify(body)).not.toContain("MustNeverReachBitwarden2");
   });
 
+  it.each([
+    ["nested email", { ...ALIAS, email: { password: "NestedSecret2" } }],
+    ["fractional id", { ...ALIAS, id: 12.5 }],
+    ["non-finite id", { ...ALIAS, id: Number.POSITIVE_INFINITY }],
+    ["empty email", { ...ALIAS, email: "" }],
+    ["malformed email", { ...ALIAS, email: "not-an-email" }],
+    ["fractional timestamp", { ...ALIAS, creation_timestamp: 1.5 }],
+    ["non-finite timestamp", { ...ALIAS, creation_timestamp: Number.NaN }],
+  ])("rejects a malformed Core alias with %s without reflecting its data", async (_case, alias) => {
+    const env = environment({ generate: async () => ({
+      alias,
+      requestId: "core-malformed-01\r\nInjected: header",
+    } as unknown as GenerateResult) });
+
+    const response = await dispatch(request(), env);
+    const body = await json(response);
+
+    expect(response.status).toBe(503);
+    expect(body).toEqual({ error: "Mailbox service temporarily unavailable" });
+    expect(JSON.stringify(body)).not.toMatch(/NestedSecret|password|not-an-email/i);
+    expect(response.headers.get("X-Request-Id")).not.toContain("core-malformed-01");
+    expectPublicHeaders(response);
+  });
+
   it("accepts hostname and mode but does not send either to Core", async () => {
     const env = environment();
     const response = await dispatch(
@@ -157,6 +181,7 @@ describe("Generator Worker", () => {
     expect(env.PREAUTH_RATE_LIMITER.limit).toHaveBeenCalledOnce();
     expect(env.TOKEN_RATE_LIMITER.limit).not.toHaveBeenCalled();
     expect(env.CORE.generateMailbox).not.toHaveBeenCalled();
+    expectPublicHeaders(response);
   });
 
   it("uses only the first 16 SHA-256 bytes as the token rate-limit key", async () => {
@@ -178,6 +203,7 @@ describe("Generator Worker", () => {
     expect(response.status).toBe(429);
     expect(await json(response)).toEqual({ error: "Too many requests" });
     expect(env.CORE.generateMailbox).not.toHaveBeenCalled();
+    expectPublicHeaders(response);
   });
 
   it("returns a stable protected response when a rate-limiter binding fails", async () => {
@@ -194,6 +220,24 @@ describe("Generator Worker", () => {
     expect(await json(response)).toEqual({ error: "Mailbox service temporarily unavailable" });
     expectPublicHeaders(response);
     expect(env.CORE.generateMailbox).not.toHaveBeenCalled();
+  });
+
+  it("contains a rejected token-rate-limiter binding after token fingerprinting", async () => {
+    const failedLimiter: FakeLimiter = {
+      limit: vi.fn(async () => {
+        throw new Error(`binding failure must not echo ${TOKEN}`);
+      }),
+    };
+    const env = environment({ token: failedLimiter });
+
+    const response = await dispatch(request(), env);
+
+    expect(response.status).toBe(503);
+    expect(await json(response)).toEqual({ error: "Mailbox service temporarily unavailable" });
+    expect(env.PREAUTH_RATE_LIMITER.limit).toHaveBeenCalledOnce();
+    expect(failedLimiter.limit).toHaveBeenCalledOnce();
+    expect(env.CORE.generateMailbox).not.toHaveBeenCalled();
+    expectPublicHeaders(response);
   });
 
   it("returns 405 for a known route with a closed method set", async () => {
@@ -235,6 +279,7 @@ describe("Generator Worker", () => {
     expect(body).toEqual({ error: "Mailbox service temporarily unavailable" });
     expect(JSON.stringify(body)).not.toMatch(/D1|SELECT|MXroute|MustNeverLeak|raw response/i);
     expect(response.headers.get("X-Request-Id")).toBe("core-timeout-01");
+    expectPublicHeaders(response);
   });
 
   it.each(["DAILY_LIMIT", "TOTAL_LIMIT"])("maps %s to quota HTTP 429", async (code) => {
@@ -245,6 +290,26 @@ describe("Generator Worker", () => {
 
     expect(response.status).toBe(429);
     expect(await json(response)).toEqual({ error: "Mailbox creation limit reached" });
+    expectPublicHeaders(response);
+  });
+
+  it("sanitizes the request ID and body for an unknown Core failure", async () => {
+    const env = environment({ generate: async () => {
+      throw {
+        code: "UNEXPECTED_PRIVATE_FAILURE",
+        requestId: "bad\r\nX-Leak: secret",
+        password: "UnknownSecret2",
+      };
+    } });
+
+    const response = await dispatch(request(), env);
+    const body = await json(response);
+
+    expect(response.status).toBe(500);
+    expect(body).toEqual({ error: "Mailbox creation failed" });
+    expect(JSON.stringify(body)).not.toMatch(/UNEXPECTED|X-Leak|UnknownSecret|password/i);
+    expect(response.headers.get("X-Request-Id")).not.toContain("bad");
+    expectPublicHeaders(response);
   });
 
   it("handles CORS preflight without authentication or limiter calls", async () => {
