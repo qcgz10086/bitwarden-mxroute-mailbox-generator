@@ -500,27 +500,55 @@ export class AdministrationService {
     });
   }
 
-  async createApiToken(identity: AdminIdentity, name: string): Promise<{ id: string; rawToken: string; requestId: string }> {
+  async createApiToken(identity: AdminIdentity, name: string, operationId: string): Promise<{ id: string; rawToken: string; requestId: string; expiresAt: string }> {
     const requestId = this.createId("request");
+    if (!/^[A-Za-z0-9_-]{16,128}$/.test(operationId)) throw new AdminError("INVALID_INPUT", requestId);
+    const existing = await this.dependencies.repository.findPendingTokenByOperation(operationId, identity.subject);
+    if (existing !== null) {
+      if (existing.name !== name.trim() || existing.pendingExpiresAt <= this.now().toISOString()) throw new AdminError("INVALID_STATE", requestId);
+      const key = this.dependencies.encryptionKeys[existing.pendingToken.keyVersion];
+      if (key === undefined) throw new AdminError("INTERNAL_ERROR", requestId);
+      const rawToken = await decryptPassword({ encrypted: existing.pendingToken, key, publicId: existing.id, email: operationId });
+      return { id: existing.id, rawToken, requestId, expiresAt: existing.pendingExpiresAt };
+    }
+    if (await this.dependencies.repository.tokenOperationExists(operationId)) throw new AdminError("INVALID_STATE", requestId);
     if (await this.dependencies.repository.countActiveTokens() >= 2) {
       await this.audit(identity, "token.create", null, "failure", "TOKEN_LIMIT", requestId);
       throw new AdminError("TOKEN_LIMIT", requestId);
     }
     const rawToken = this.generateToken();
     const id = this.createId("token");
-    const now = this.now().toISOString();
+    const nowDate = this.now();
+    const now = nowDate.toISOString();
+    const expiresAt = new Date(nowDate.getTime() + 10 * 60_000).toISOString();
     try {
+      const pendingToken = await encryptPassword({ password: rawToken, key: this.dependencies.encryptionKeys[this.dependencies.encryptionKeyVersion]!, publicId: id, email: operationId, keyVersion: this.dependencies.encryptionKeyVersion });
       await this.dependencies.repository.createTokenDigestWithAudit({
         id, name: name.trim(), digest: await tokenHmac(rawToken, this.dependencies.tokenPepper), createdAt: now,
-      }, this.adminEvent(identity,"token.create",null,"success",null,requestId));
-      return { id, rawToken, requestId };
+        operationId, pendingActorId: identity.subject, pendingToken, pendingExpiresAt: expiresAt,
+      }, this.adminEvent(identity,"token.create.pending",null,"success",null,requestId));
+      return { id, rawToken, requestId, expiresAt };
     } catch (error) {
+      const concurrent = await this.dependencies.repository.findPendingTokenByOperation(operationId, identity.subject);
+      if (concurrent !== null && concurrent.name === name.trim() && concurrent.pendingExpiresAt > this.now().toISOString()) {
+        const key = this.dependencies.encryptionKeys[concurrent.pendingToken.keyVersion];
+        if (key !== undefined) {
+          const recovered = await decryptPassword({ encrypted: concurrent.pendingToken, key, publicId: concurrent.id, email: operationId });
+          return { id: concurrent.id, rawToken: recovered, requestId, expiresAt: concurrent.pendingExpiresAt };
+        }
+      }
       const code = error instanceof RepositoryError && error.code === "TOKEN_LIMIT"
         ? "TOKEN_LIMIT"
         : "INTERNAL_ERROR";
       await this.audit(identity, "token.create", null, "failure", code, requestId);
       throw new AdminError(code, requestId);
     }
+  }
+
+  acknowledgeApiToken(identity: AdminIdentity, id: string, operationId: string): Promise<{ requestId: string }> {
+    return this.adminMutation(identity, "token.create.acknowledge", null, async (event) => {
+      await this.dependencies.repository.acknowledgeTokenWithAudit(id, operationId, identity.subject, this.now().toISOString(), event);
+    });
   }
 
   revokeApiToken(identity: AdminIdentity, id: string): Promise<{ requestId: string }> {
@@ -542,7 +570,13 @@ export class AdministrationService {
   }
 
   async reconcileAll(): Promise<number> {
-    return this.reconcile(["pending", "reset_unknown", "resetting", "deleting"]);
+    const now = this.now().toISOString();
+    const expired = await this.dependencies.repository.listExpiredPendingTokenIds(now);
+    for (const id of expired) {
+      await this.dependencies.repository.expirePendingTokenWithAudit(id, now, now,
+        this.systemAudit("token.create.expire", null, "success", null, now));
+    }
+    return expired.length + await this.reconcile(["pending", "reset_unknown", "resetting", "deleting"]);
   }
 
   private async reconcile(statuses: readonly ("pending" | "reset_unknown" | "resetting" | "deleting")[]): Promise<number> {
@@ -670,7 +704,7 @@ export class AdministrationService {
     });
   }
 
-  private systemAudit(action: string, email: string, result: string, errorCode: string | null, now: string): import("./repository").AuditEventInput {
+  private systemAudit(action: string, email: string | null, result: string, errorCode: string | null, now: string): import("./repository").AuditEventInput {
     return {
       id: this.createId("audit"), actorType: "system", actorId: "scheduled",
       actorEmail: null, action, email, result, errorCode,

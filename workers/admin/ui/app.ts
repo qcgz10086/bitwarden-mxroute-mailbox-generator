@@ -132,8 +132,9 @@ export class SingleDisplaySecret {
 }
 
 interface TokenWorkflowDependencies {
-  create(name: string): Promise<{ id: string; rawToken: string }>;
-  revoke(id: string): Promise<unknown>;
+  create(name: string, operationId: string): Promise<{ id: string; rawToken: string }>;
+  acknowledge(id: string, operationId: string): Promise<unknown>;
+  revoke(id: string, keepalive?: boolean): Promise<unknown>;
   display(rawToken: string): void;
   clear(): void;
   report(code: "TOKEN_CREATE_FAILED" | "TOKEN_COMPENSATION_FAILED" | "TOKEN_DISPLAY_FAILED_COMPENSATED" | "TOKEN_DISPLAY_FAILED_COMPENSATION_FAILED"): void;
@@ -144,16 +145,20 @@ export class TokenCreationWorkflow {
   private generation = 0;
   private rawToken: string | null = null;
   private tokenId: string | null = null;
+  private operationId: string | null = null;
+  private operationName: string | null = null;
   private saved = false;
   private readonly revocations = new Map<string, Promise<boolean>>();
   constructor(private readonly dependencies: TokenWorkflowDependencies) {}
   busy(): boolean { return this.creating || this.rawToken !== null; }
   async create(name: string): Promise<"displayed" | "revoked" | "failed" | "busy" | "display-compensated" | "display-compensation-failed"> {
     if (this.busy() || !this.contextActive) return "busy";
+    if (this.operationId !== null && this.operationName !== name) return "busy";
     this.creating = true; const generation = ++this.generation;
     let result: { id: string; rawToken: string };
     try {
-      result = await this.dependencies.create(name);
+      const operationId = this.operationId ?? crypto.randomUUID(); this.operationId = operationId; this.operationName = name;
+      result = await this.dependencies.create(name, operationId);
     } catch {
       this.creating = false; if (this.contextActive && generation === this.generation) this.dependencies.report("TOKEN_CREATE_FAILED"); return "failed";
     }
@@ -172,9 +177,9 @@ export class TokenCreationWorkflow {
     if (current === null || id === null || !this.contextActive) return false;
     await writeText(current);
     if (!this.contextActive || generation !== this.generation || this.rawToken !== current || this.tokenId !== id || this.revocations.has(id)) return false;
-    this.saved = true; return true;
+    await this.acknowledge(); return true;
   }
-  dismissSaved(): void { this.saved = true; this.clearDisplay(); }
+  async dismissSaved(): Promise<void> { await this.acknowledge(); this.clearDisplay(); }
   closeWithoutSave(): void {
     const id = this.tokenId; const shouldRevoke = id !== null && !this.saved;
     this.clearDisplay(); if (shouldRevoke) void this.revokeOnce(id);
@@ -182,13 +187,18 @@ export class TokenCreationWorkflow {
   pagehide(): void {
     this.contextActive = false; this.generation += 1;
     const id = this.tokenId; const shouldRevoke = id !== null && !this.saved;
-    this.clearDisplay(); if (shouldRevoke) void this.revokeOnce(id);
+    this.clearDisplay(); if (shouldRevoke) void this.revokeOnce(id, true, false);
   }
   async compensation(): Promise<void> { await Promise.all(this.revocations.values()); }
-  private clearDisplay(): void { this.generation += 1; this.rawToken = null; this.tokenId = null; this.saved = false; try { this.dependencies.clear(); } catch {} }
-  private revokeOnce(id: string, reportFailure = true): Promise<boolean> {
+  private async acknowledge(): Promise<void> {
+    if (this.tokenId === null || this.operationId === null || this.saved) return;
+    await this.dependencies.acknowledge(this.tokenId, this.operationId); this.saved = true;
+  }
+  private clearDisplay(): void { this.generation += 1; this.rawToken = null; this.tokenId = null; this.operationId = null; this.operationName = null; this.saved = false; try { this.dependencies.clear(); } catch {} }
+  private revokeOnce(id: string, keepalive = false, reportFailure = true): Promise<boolean> {
     const existing = this.revocations.get(id); if (existing) return existing;
-    const operation = this.dependencies.revoke(id).then(() => true).catch(() => { if (reportFailure && this.contextActive) this.dependencies.report("TOKEN_COMPENSATION_FAILED"); return false; });
+    const request = keepalive ? this.dependencies.revoke(id, true) : this.dependencies.revoke(id);
+    const operation = request.then(() => true).catch(() => { if (reportFailure && this.contextActive) this.dependencies.report("TOKEN_COMPENSATION_FAILED"); return false; });
     this.revocations.set(id, operation); return operation;
   }
 }
@@ -202,7 +212,7 @@ export function validateSettingsInput(value: SettingsInput): string[] {
   return errors;
 }
 
-type BrowserRequestInit = RequestInit & { credentials?: "same-origin" };
+type BrowserRequestInit = RequestInit & { credentials?: "same-origin"; keepalive?: boolean };
 type Fetcher = (input: RequestInfo | URL, init?: BrowserRequestInit) => Promise<Response>;
 export class AdminApi {
   private csrfToken: string | null = null;
@@ -217,7 +227,11 @@ export class AdminApi {
     if (signal) init.signal = signal;
     return this.request<T>(path, init);
   }
-  private async request<T>(path: string, init: RequestInit): Promise<T> {
+  mutateKeepalive<T>(path: string, method: "POST" | "DELETE", body: object = {}): Promise<T> {
+    if (!this.csrfToken) throw new Error("Session is not initialized.");
+    return this.request<T>(path, { method, keepalive: true, headers: { "Content-Type": "application/json", "X-CSRF-Token": this.csrfToken }, body: JSON.stringify(body) });
+  }
+  private async request<T>(path: string, init: BrowserRequestInit): Promise<T> {
     if (!path.startsWith("/api/") || (path[0] === "/" && path[1] === "/") || path.includes("\\")) throw new Error("Only same-origin API paths are allowed.");
     const response = await this.fetcher(path, { ...init, credentials: "same-origin", headers: { Accept: "application/json", ...init.headers } });
     const data = await response.json().catch(() => ({})) as Record<string, unknown>;
@@ -363,8 +377,9 @@ async function loadMoreRecovery(): Promise<void> {
 function bind(): void {
   const tokenButton = byId<HTMLButtonElement>("create-token"); const tokenDialog = byId<HTMLDialogElement>("token-dialog");
   const tokenWorkflow = new TokenCreationWorkflow({
-    create: (name) => api.mutate<{ id: string; rawToken: string }>("/api/tokens", "POST", { name }),
-    revoke: (id) => api.mutate(`/api/tokens/${encodeURIComponent(id)}`, "DELETE"),
+    create: (name, operationId) => api.mutate<{ id: string; rawToken: string }>("/api/tokens", "POST", { name, operationId }),
+    acknowledge: (id, operationId) => api.mutate(`/api/tokens/${encodeURIComponent(id)}/acknowledge`, "POST", { operationId }),
+    revoke: (id, keepalive) => keepalive ? api.mutateKeepalive(`/api/tokens/${encodeURIComponent(id)}`, "DELETE") : api.mutate(`/api/tokens/${encodeURIComponent(id)}`, "DELETE"),
     display: (rawToken) => { concealAllMailboxSecrets(); text(byId("raw-token"), rawToken); tokenDialog.showModal(); },
     clear: () => { text(byId("raw-token"), ""); tokenButton.disabled = false; },
     report: (code) => {
@@ -388,7 +403,7 @@ function bind(): void {
   });
   byId("copy-token").addEventListener("click", () => { void tokenWorkflow.copyTo((value) => navigator.clipboard.writeText(value)).then((copied) => { if (copied) status("Token copied and marked as saved."); }).catch(fail); });
   tokenDialog.addEventListener("close", () => tokenWorkflow.closeWithoutSave());
-  byId("dismiss-token").addEventListener("click", () => { tokenWorkflow.dismissSaved(); tokenDialog.close(); });
+  byId("dismiss-token").addEventListener("click", () => { void tokenWorkflow.dismissSaved().then(() => tokenDialog.close()).catch(fail); });
   byId("delete-form").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); const input = byId<HTMLInputElement>("delete-confirmation"); void performExactDelete(input.dataset.id ?? "", input.dataset.email ?? "", input.value, (path, method, body) => api.mutate(path, method, body), () => byId<HTMLDialogElement>("delete-dialog").close()).then(async (deleted) => { if (!deleted) return status("Type the complete email address exactly."); await loadMailboxes(); await loadRecovery(); status("Mailbox permanently deleted."); }).catch(fail); });
   const refreshButton = byId<HTMLButtonElement>("refresh-recovery"); const moreButton = byId<HTMLButtonElement>("recovery-more");
   byId("cancel-delete").addEventListener("click", () => byId<HTMLDialogElement>("delete-dialog").close()); byId("audit-next").addEventListener("click", () => { if (auditCursor) void loadAudit(auditCursor).catch(fail); });

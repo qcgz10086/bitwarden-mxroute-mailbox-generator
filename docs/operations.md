@@ -86,6 +86,11 @@ npx wrangler deploy --dry-run --config "$configRoot/generator.jsonc" --profile p
 npx wrangler deploy --dry-run --config "$configRoot/admin.jsonc" --profile personal
 ```
 
+Dry-run binding gate: Generator must select `GeneratorEntrypoint`; Admin must select
+`AdminEntrypoint`. Missing or swapped `services[].entrypoint` values are a release blocker. Core's
+default export is scheduled-recovery only. Pending API-token issuance is encrypted and expires after
+ten minutes; the five-minute cron must remain enabled so abandoned, unacknowledged tokens are revoked.
+
 逐项检查 dry-run 的绑定输出：Core 只有目标环境 D1；Generator 只有同环境 Core 和两个 Rate Limiter；Admin 只有同环境 Core、Assets 及四项预期 vars。Wrangler dry-run 不一定打印 cron/route，因此还要直接检查最终 `core.jsonc`：含 `*/5 * * * *`，`workers_dev=false`，没有 `routes`；所有配置中的 `account_id`、Worker 名称、D1 名称/ID和主机名必须与 WhatIf 摘要一致。检查通过后才运行相同的 Finalize 命令并使用 `-Confirm`：
 
 ```powershell

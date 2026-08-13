@@ -7,7 +7,8 @@
   "services": [
     {
       "binding": "CORE",
-      "service": "bitwarden-mxroute-core"
+      "service": "bitwarden-mxroute-core",
+      "entrypoint": "GeneratorEntrypoint"
     }
   ],
   "ratelimits": [

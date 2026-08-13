@@ -104,6 +104,10 @@ export interface CreateTokenDigestInput {
   readonly name: string;
   readonly digest: Uint8Array;
   readonly createdAt: string;
+  readonly operationId?: string;
+  readonly pendingActorId?: string;
+  readonly pendingToken?: EncryptedValue;
+  readonly pendingExpiresAt?: string;
 }
 
 export interface ApiTokenRecord {
@@ -112,6 +116,12 @@ export interface ApiTokenRecord {
   readonly createdAt: string;
   readonly lastUsedAt: string | null;
   readonly revokedAt: string | null;
+}
+
+export interface PendingApiTokenRecord extends ApiTokenRecord {
+  readonly operationId: string;
+  readonly pendingToken: EncryptedValue;
+  readonly pendingExpiresAt: string;
 }
 
 export interface AuditEventInput {
@@ -705,9 +715,9 @@ export class Repository {
   async createTokenDigest(input: CreateTokenDigestInput): Promise<void> {
     try {
       await this.db.prepare(`INSERT INTO api_tokens(
-        id, name, token_hmac, created_at
-      ) VALUES(?, ?, ?, ?)`)
-        .bind(input.id, input.name, toArrayBuffer(input.digest), input.createdAt)
+        id, name, token_hmac, created_at, acknowledged_at
+      ) VALUES(?, ?, ?, ?, ?)`)
+        .bind(input.id, input.name, toArrayBuffer(input.digest), input.createdAt, input.pendingToken ? null : input.createdAt)
         .run();
     } catch (error) {
       throw normalizeDatabaseError(error);
@@ -716,9 +726,54 @@ export class Repository {
 
   async createTokenDigestWithAudit(input: CreateTokenDigestInput, event: AuditEventInput): Promise<void> {
     try {
-      await this.mutateWithAudit(this.db.prepare(`INSERT INTO api_tokens(id,name,token_hmac,created_at)
-        VALUES(?,?,?,?)`).bind(input.id,input.name,toArrayBuffer(input.digest),input.createdAt), event);
+      await this.mutateWithAudit(this.db.prepare(`INSERT INTO api_tokens(
+        id,name,token_hmac,created_at,operation_id,pending_actor_id,pending_token_ciphertext,pending_token_nonce,
+        pending_token_key_version,pending_expires_at,acknowledged_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).bind(
+        input.id,input.name,toArrayBuffer(input.digest),input.createdAt,input.operationId ?? null,input.pendingActorId ?? null,
+        input.pendingToken ? toArrayBuffer(input.pendingToken.ciphertext) : null,
+        input.pendingToken ? toArrayBuffer(input.pendingToken.nonce) : null,
+        input.pendingToken?.keyVersion ?? null,input.pendingExpiresAt ?? null,input.pendingToken ? null : input.createdAt,
+      ), event);
     } catch (error) { throw normalizeDatabaseError(error); }
+  }
+
+  async findPendingTokenByOperation(operationId: string, actorId: string): Promise<PendingApiTokenRecord | null> {
+    const row = await this.db.prepare(`SELECT id,name,created_at,last_used_at,revoked_at,operation_id,
+      pending_token_ciphertext,pending_token_nonce,pending_token_key_version,pending_expires_at
+      FROM api_tokens WHERE operation_id=? AND pending_actor_id=? AND revoked_at IS NULL AND acknowledged_at IS NULL`)
+      .bind(operationId,actorId).first<Record<string, unknown>>();
+    if (row === null || row.pending_token_ciphertext == null || row.pending_token_nonce == null) return null;
+    return {
+      id: String(row.id), name: String(row.name), createdAt: String(row.created_at),
+      lastUsedAt: row.last_used_at == null ? null : String(row.last_used_at), revokedAt: null,
+      operationId: String(row.operation_id), pendingExpiresAt: String(row.pending_expires_at),
+      pendingToken: { ciphertext: fromBlob(row.pending_token_ciphertext), nonce: fromBlob(row.pending_token_nonce), keyVersion: Number(row.pending_token_key_version) },
+    };
+  }
+
+  async tokenOperationExists(operationId: string): Promise<boolean> {
+    return await this.db.prepare("SELECT 1 found FROM api_tokens WHERE operation_id=?").bind(operationId).first("found") === 1;
+  }
+
+  async acknowledgeTokenWithAudit(id: string, operationId: string, actorId: string, acknowledgedAt: string, event: AuditEventInput): Promise<void> {
+    await this.mutateWithAudit(this.db.prepare(`UPDATE api_tokens SET acknowledged_at=?,
+      pending_token_ciphertext=NULL,pending_token_nonce=NULL,pending_token_key_version=NULL,pending_expires_at=NULL,pending_actor_id=NULL
+      WHERE id=? AND operation_id=? AND pending_actor_id=? AND revoked_at IS NULL AND acknowledged_at IS NULL`)
+      .bind(acknowledgedAt,id,operationId,actorId), event);
+  }
+
+  async listExpiredPendingTokenIds(expiredBefore: string, limit = 25): Promise<readonly string[]> {
+    const result = await this.db.prepare(`SELECT id FROM api_tokens WHERE revoked_at IS NULL
+      AND acknowledged_at IS NULL AND pending_expires_at<=? ORDER BY pending_expires_at,id LIMIT ?`)
+      .bind(expiredBefore,limit).all<{ id: string }>();
+    return result.results.map((row) => row.id);
+  }
+
+  async expirePendingTokenWithAudit(id: string, expiredBefore: string, revokedAt: string, event: AuditEventInput): Promise<void> {
+    await this.mutateWithAudit(this.db.prepare(`UPDATE api_tokens SET revoked_at=?,pending_token_ciphertext=NULL,
+      pending_token_nonce=NULL,pending_token_key_version=NULL,pending_expires_at=NULL,pending_actor_id=NULL WHERE id=?
+      AND revoked_at IS NULL AND acknowledged_at IS NULL AND pending_expires_at<=?`).bind(revokedAt,id,expiredBefore), event);
   }
 
   async countActiveTokens(): Promise<number> {
@@ -735,13 +790,15 @@ export class Repository {
   }
 
   async revokeToken(id: string, revokedAt: string): Promise<void> {
-    const result = await this.db.prepare(`UPDATE api_tokens SET revoked_at = ?
+    const result = await this.db.prepare(`UPDATE api_tokens SET revoked_at = ?,pending_token_ciphertext=NULL,
+      pending_token_nonce=NULL,pending_token_key_version=NULL,pending_expires_at=NULL,pending_actor_id=NULL
       WHERE id = ? AND revoked_at IS NULL`).bind(revokedAt, id).run();
     requireSingleChange(result);
   }
 
   async revokeTokenWithAudit(id: string, revokedAt: string, event: AuditEventInput): Promise<void> {
-    await this.mutateWithAudit(this.db.prepare("UPDATE api_tokens SET revoked_at=? WHERE id=? AND revoked_at IS NULL")
+    await this.mutateWithAudit(this.db.prepare(`UPDATE api_tokens SET revoked_at=?,pending_token_ciphertext=NULL,
+      pending_token_nonce=NULL,pending_token_key_version=NULL,pending_expires_at=NULL,pending_actor_id=NULL WHERE id=? AND revoked_at IS NULL`)
       .bind(revokedAt,id), event);
   }
 
@@ -750,11 +807,11 @@ export class Repository {
     const [updateResult, selectResult] = await this.db.batch([
       this.db.prepare(`UPDATE api_tokens
         SET last_used_at = ?
-        WHERE token_hmac = ? AND revoked_at IS NULL`)
+        WHERE token_hmac = ? AND revoked_at IS NULL AND acknowledged_at IS NOT NULL`)
         .bind(lastUsedAt, blob),
       this.db.prepare(`SELECT id, name, created_at, last_used_at, revoked_at
         FROM api_tokens
-        WHERE token_hmac = ? AND revoked_at IS NULL`)
+        WHERE token_hmac = ? AND revoked_at IS NULL AND acknowledged_at IS NOT NULL`)
         .bind(blob),
     ]);
     if (Number(updateResult?.meta.changes ?? 0) !== 1) {

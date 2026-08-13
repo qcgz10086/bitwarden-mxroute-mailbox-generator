@@ -121,7 +121,7 @@ describe("AdministrationService configuration and tokens", () => {
     const repository = new Repository(env.DB);
     await repository.syncDomains([DOMAIN], NOW);
     const service = adminService();
-    const created = await service.createApiToken(ADMIN, "Phone");
+    const created = await service.createApiToken(ADMIN, "Phone", "operation-phone-0001");
 
     expect(await service.listDomains(ADMIN)).toEqual([{ domain: DOMAIN, active: true, syncedAt: NOW }]);
     expect(await service.getSettings(ADMIN)).toMatchObject({ mailboxQuotaMb: 100, prefixLength: 12 });
@@ -164,16 +164,28 @@ describe("AdministrationService configuration and tokens", () => {
 
   it("stores only token HMACs, allows two live tokens, and rejects creation of a third", async () => {
     const service = adminService();
-    const first = await service.createApiToken(ADMIN, "Primary");
-    const second = await service.createApiToken(ADMIN, "Rotation");
-    await expectAdminError(service.createApiToken(ADMIN, "Third"), "TOKEN_LIMIT");
+    const first = await service.createApiToken(ADMIN, "Primary", "operation-primary-0001");
+    const pendingStorage = await env.DB.prepare(`SELECT hex(pending_token_ciphertext) ciphertext,
+      hex(pending_token_nonce) nonce,acknowledged_at FROM api_tokens WHERE id=?`).bind(first.id)
+      .first<{ ciphertext: string; nonce: string; acknowledged_at: string | null }>();
+    const rawHex = Array.from(new TextEncoder().encode(first.rawToken), (byte) => byte.toString(16).padStart(2, "0")).join("").toUpperCase();
+    expect(pendingStorage).toMatchObject({ acknowledged_at: null });
+    expect(pendingStorage?.ciphertext).not.toContain(rawHex);
+    expect(pendingStorage?.nonce).not.toContain(rawHex);
+    const retry = await service.createApiToken(ADMIN, "Primary", "operation-primary-0001");
+    expect(retry).toMatchObject({ id: first.id, rawToken: first.rawToken });
+    await service.acknowledgeApiToken(ADMIN, first.id, "operation-primary-0001");
+    await expectAdminError(service.createApiToken(ADMIN, "Primary", "operation-primary-0001"), "INVALID_STATE");
+    const second = await service.createApiToken(ADMIN, "Rotation", "operation-rotation-0001");
+    await expectAdminError(service.createApiToken(ADMIN, "Third", "operation-third-0001"), "TOKEN_LIMIT");
 
     expect(first.rawToken).toMatch(/^raw-token-/);
     expect(second.rawToken).toMatch(/^raw-token-/);
     expect(second.rawToken).not.toBe(first.rawToken);
-    const rows = await env.DB.prepare("SELECT token_hmac FROM api_tokens ORDER BY created_at").all<{ token_hmac: unknown }>();
+    const rows = await env.DB.prepare("SELECT token_hmac,pending_token_ciphertext,acknowledged_at FROM api_tokens ORDER BY created_at").all<Record<string, unknown>>();
     expect(rows.results).toHaveLength(2);
     expect(JSON.stringify(rows.results)).not.toContain(first.rawToken);
+    expect(rows.results[0]).toMatchObject({ pending_token_ciphertext: null, acknowledged_at: NOW });
     expect(await new Repository(env.DB).verifyTokenDigest(await tokenHmac(first.rawToken, TOKEN_PEPPER), NOW)).not.toBeNull();
     await expect(new Repository(env.DB).createTokenDigest({
       id: "concurrent-third", name: "Concurrent third", digest: new Uint8Array([9]), createdAt: NOW,
@@ -181,6 +193,18 @@ describe("AdministrationService configuration and tokens", () => {
 
     await service.revokeApiToken(ADMIN, first.id);
     expect(await new Repository(env.DB).verifyTokenDigest(await tokenHmac(first.rawToken, TOKEN_PEPPER), NOW)).toBeNull();
+  });
+
+  it("revokes and clears expired unacknowledged token issuance", async () => {
+    const service = adminService();
+    const created = await service.createApiToken(ADMIN, "Abandoned", "operation-abandoned-0001");
+    expect(await new Repository(env.DB).verifyTokenDigest(await tokenHmac(created.rawToken, TOKEN_PEPPER), NOW)).toBeNull();
+    await env.DB.prepare("UPDATE api_tokens SET pending_expires_at='2000-01-01T00:00:00.000Z'").run();
+    expect(await service.reconcileAll()).toBeGreaterThanOrEqual(1);
+    const row = await env.DB.prepare("SELECT revoked_at,pending_token_ciphertext,pending_token_nonce FROM api_tokens WHERE id=?")
+      .bind(created.id).first<Record<string, unknown>>();
+    expect(row).toMatchObject({ pending_token_ciphertext: null, pending_token_nonce: null });
+    expect(row?.revoked_at).toBe(NOW);
   });
 
   it("paginates mailbox and audit records without secret fields", async () => {

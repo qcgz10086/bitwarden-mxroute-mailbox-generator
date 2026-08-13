@@ -191,7 +191,7 @@ describe("sensitive event workflows", () => {
   it("compensates exactly once when pagehide wins the race with successful token creation", async () => {
     const creation = deferred<{ id: string; rawToken: string }>();
     const create = vi.fn(() => creation.promise); const revoke = vi.fn(async () => undefined); const display = vi.fn(); const clear = vi.fn();
-    const workflow = new TokenCreationWorkflow({ create, revoke, display, clear, report: vi.fn() });
+    const workflow = new TokenCreationWorkflow({ create, acknowledge: vi.fn(async () => undefined), revoke, display, clear, report: vi.fn() });
     const pending = workflow.create("phone"); workflow.pagehide();
     creation.resolve({ id: "token-1", rawToken: "one-time-raw" });
     await expect(pending).resolves.toBe("revoked");
@@ -201,18 +201,41 @@ describe("sensitive event workflows", () => {
 
   it("revokes an unsaved displayed token on pagehide but retains a successfully copied token", async () => {
     const revoke = vi.fn(async () => undefined); const display = vi.fn();
-    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t1", rawToken: "raw1" })), revoke, display, clear: vi.fn(), report: vi.fn() });
+    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t1", rawToken: "raw1" })), acknowledge: vi.fn(async () => undefined), revoke, display, clear: vi.fn(), report: vi.fn() });
     await expect(workflow.create("first")).resolves.toBe("displayed"); workflow.pagehide(); await workflow.compensation();
-    expect(revoke).toHaveBeenCalledExactlyOnceWith("t1");
+    expect(revoke).toHaveBeenCalledExactlyOnceWith("t1", true);
 
-    const secondRevoke = vi.fn(async () => undefined); const copied = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t2", rawToken: "raw2" })), revoke: secondRevoke, display: vi.fn(), clear: vi.fn(), report: vi.fn() });
+    const secondRevoke = vi.fn(async () => undefined); const copied = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t2", rawToken: "raw2" })), acknowledge: vi.fn(async () => undefined), revoke: secondRevoke, display: vi.fn(), clear: vi.fn(), report: vi.fn() });
     await copied.create("second"); await copied.copyTo(async () => undefined); copied.pagehide(); await copied.compensation();
     expect(secondRevoke).not.toHaveBeenCalled();
   });
 
+  it("acknowledges only after clipboard acceptance and uses a stable operation id", async () => {
+    const create = vi.fn(async (_name: string, _operationId: string) => ({ id: "t-ack", rawToken: "raw-ack" }));
+    const acknowledge = vi.fn(async () => undefined);
+    const workflow = new TokenCreationWorkflow({ create, acknowledge, revoke: vi.fn(async () => undefined), display: vi.fn(), clear: vi.fn(), report: vi.fn() });
+    await workflow.create("phone");
+    const operationId = create.mock.calls[0]?.[1];
+    expect(operationId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(acknowledge).not.toHaveBeenCalled();
+    await expect(workflow.copyTo(async () => undefined)).resolves.toBe(true);
+    expect(acknowledge).toHaveBeenCalledExactlyOnceWith("t-ack", operationId);
+  });
+
+  it("reuses the operation id after a committed response is lost", async () => {
+    const create = vi.fn(async (_name: string, operationId: string) => {
+      if (create.mock.calls.length === 1) throw new TypeError("response lost");
+      return { id: "t-recovered", rawToken: "same-server-token", operationId };
+    });
+    const workflow = new TokenCreationWorkflow({ create, acknowledge: vi.fn(async () => undefined), revoke: vi.fn(async () => undefined), display: vi.fn(), clear: vi.fn(), report: vi.fn() });
+    await expect(workflow.create("phone")).resolves.toBe("failed");
+    await expect(workflow.create("phone")).resolves.toBe("displayed");
+    expect(create.mock.calls[1]?.[1]).toBe(create.mock.calls[0]?.[1]);
+  });
+
   it("keeps compensation failures secret-free and reports only while context remains", async () => {
     const report = vi.fn(); const display = vi.fn();
-    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t1", rawToken: "never-log-this" })), revoke: vi.fn(async () => { throw new Error("upstream leaked body"); }), display, clear: vi.fn(), report });
+    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t1", rawToken: "never-log-this" })), acknowledge: vi.fn(async () => undefined), revoke: vi.fn(async () => { throw new Error("upstream leaked body"); }), display, clear: vi.fn(), report });
     await workflow.create("x"); workflow.pagehide(); await workflow.compensation();
     expect(display).toHaveBeenCalledTimes(1); expect(report).not.toHaveBeenCalled();
     expect(JSON.stringify(report.mock.calls)).not.toContain("never-log-this");
@@ -220,7 +243,7 @@ describe("sensitive event workflows", () => {
 
   it("compensates a created token when display throws without misreporting creation failure", async () => {
     const revoke = vi.fn(async () => undefined); const report = vi.fn(); const clear = vi.fn();
-    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "created-id", rawToken: "display-secret" })), revoke, display: vi.fn(() => { throw new Error("DOM detached: display-secret"); }), clear, report });
+    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "created-id", rawToken: "display-secret" })), acknowledge: vi.fn(async () => undefined), revoke, display: vi.fn(() => { throw new Error("DOM detached: display-secret"); }), clear, report });
     await expect(workflow.create("broken-display")).resolves.toBe("display-compensated");
     expect(revoke).toHaveBeenCalledExactlyOnceWith("created-id"); expect(clear).toHaveBeenCalled(); expect(workflow.busy()).toBe(false);
     expect(report).toHaveBeenCalledWith("TOKEN_DISPLAY_FAILED_COMPENSATED"); expect(report).not.toHaveBeenCalledWith("TOKEN_CREATE_FAILED");
@@ -229,7 +252,7 @@ describe("sensitive event workflows", () => {
 
   it("keeps display-compensation failure secret-free and the workflow reusable", async () => {
     const report = vi.fn(); const revoke = vi.fn(async () => { throw new Error("secret upstream detail"); });
-    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "created-id", rawToken: "raw-never-report" })), revoke, display: vi.fn(() => { throw new Error("display failed raw-never-report"); }), clear: vi.fn(), report });
+    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "created-id", rawToken: "raw-never-report" })), acknowledge: vi.fn(async () => undefined), revoke, display: vi.fn(() => { throw new Error("display failed raw-never-report"); }), clear: vi.fn(), report });
     await expect(workflow.create("broken-display")).resolves.toBe("display-compensation-failed");
     expect(revoke).toHaveBeenCalledExactlyOnceWith("created-id"); expect(workflow.busy()).toBe(false);
     expect(report).toHaveBeenCalledWith("TOKEN_DISPLAY_FAILED_COMPENSATION_FAILED");
@@ -238,16 +261,16 @@ describe("sensitive event workflows", () => {
 
   it("does not mark a token saved when close invalidates it while clipboard is pending", async () => {
     const clipboard = deferred<void>(); const revoke = vi.fn(async () => undefined);
-    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t-close", rawToken: "raw-close" })), revoke, display: vi.fn(), clear: vi.fn(), report: vi.fn() });
+    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t-close", rawToken: "raw-close" })), acknowledge: vi.fn(async () => undefined), revoke, display: vi.fn(), clear: vi.fn(), report: vi.fn() });
     await workflow.create("close"); const copying = workflow.copyTo(() => clipboard.promise); workflow.closeWithoutSave(); clipboard.resolve();
     await expect(copying).resolves.toBe(false); await workflow.compensation(); expect(revoke).toHaveBeenCalledExactlyOnceWith("t-close");
   });
 
   it("does not announce saved when pagehide invalidates a pending clipboard write", async () => {
     const clipboard = deferred<void>(); const revoke = vi.fn(async () => undefined);
-    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t-hide", rawToken: "raw-hide" })), revoke, display: vi.fn(), clear: vi.fn(), report: vi.fn() });
+    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t-hide", rawToken: "raw-hide" })), acknowledge: vi.fn(async () => undefined), revoke, display: vi.fn(), clear: vi.fn(), report: vi.fn() });
     await workflow.create("hide"); const copying = workflow.copyTo(() => clipboard.promise); workflow.pagehide(); clipboard.resolve();
-    await expect(copying).resolves.toBe(false); await workflow.compensation(); expect(revoke).toHaveBeenCalledExactlyOnceWith("t-hide");
+    await expect(copying).resolves.toBe(false); await workflow.compensation(); expect(revoke).toHaveBeenCalledExactlyOnceWith("t-hide", true);
   });
 
   it("filters default-domain choices to active domains and keeps exact delete semantics", () => {

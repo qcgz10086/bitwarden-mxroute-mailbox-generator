@@ -37,7 +37,8 @@ export interface AdminCore {
   getSettings(identity: AdminIdentity): Promise<RepositorySettings>;
   updateSettings(identity: AdminIdentity, patch: AdminSettingsPatch): Promise<RepositorySettings & { requestId: string }>;
   listApiTokens(identity: AdminIdentity): Promise<readonly ApiTokenRecord[]>;
-  createApiToken(identity: AdminIdentity, name: string): Promise<{ id: string; rawToken: string; requestId: string }>;
+  createApiToken(identity: AdminIdentity, name: string, operationId: string): Promise<{ id: string; rawToken: string; requestId: string; expiresAt: string }>;
+  acknowledgeApiToken(identity: AdminIdentity, id: string, operationId: string): Promise<{ requestId: string }>;
   revokeApiToken(identity: AdminIdentity, id: string): Promise<{ requestId: string }>;
   pageAudit(identity: AdminIdentity, options: PageAuditOptions): Promise<AuditPage>;
 }
@@ -140,8 +141,14 @@ async function route(request: Request, url: URL, method: string, identity: Admin
   }
   if (path === "/api/tokens") {
     requireMethod(method, "POST"); rejectQuery(url, new Set());
-    const body = await readObject(request, new Set(["name"]));
-    return json(await core.createApiToken(identity, requireString(body, "name", 100)));
+    const body = await readObject(request, new Set(["name", "operationId"]));
+    return json(await core.createApiToken(identity, requireString(body, "name", 100), requireOperationId(body)));
+  }
+  match = path.match(/^\/api\/tokens\/([^/]+)\/acknowledge$/);
+  if (match) {
+    requireMethod(method, "POST"); rejectQuery(url, new Set());
+    const body = await readObject(request, new Set(["operationId"]));
+    return json(await core.acknowledgeApiToken(identity, decodeId(match[1]!), requireOperationId(body)));
   }
   match = path.match(/^\/api\/tokens\/([^/]+)$/);
   if (match) {
@@ -153,6 +160,12 @@ async function route(request: Request, url: URL, method: string, identity: Admin
   }
   if (["GET", "POST", "PUT", "DELETE"].includes(method)) throw new HttpError(404, "NOT_FOUND");
   throw new HttpError(405, "METHOD_NOT_ALLOWED");
+}
+
+function requireOperationId(body: Record<string, unknown>): string {
+  const value = requireString(body, "operationId", 128);
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(value)) throw new HttpError(400, "INVALID_INPUT");
+  return value;
 }
 
 function mailboxQuery(url: URL): PageMailboxesOptions {

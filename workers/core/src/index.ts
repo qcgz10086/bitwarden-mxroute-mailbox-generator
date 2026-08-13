@@ -1,126 +1,55 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
-
-import type {
-  AdminIdentity,
-  GenerateResult,
-  MailboxPage,
-} from "../../../packages/contracts/src/index";
+import type { AdminIdentity, GenerateResult, MailboxPage } from "../../../packages/contracts/src/index";
 import { MxrouteClient } from "./mxroute";
-import {
-  Repository,
-  type AuditPage,
-  type DomainRecord,
-  type PageAuditOptions,
-  type PageMailboxesOptions,
-  type RepositorySettings,
-} from "./repository";
-import {
-  AdministrationService,
-  type AdminSettingsPatch,
-  MailboxService,
-} from "./service";
+import { Repository, type AuditPage, type DomainRecord, type PageAuditOptions, type PageMailboxesOptions, type RepositorySettings } from "./repository";
+import { AdministrationService, type AdminSettingsPatch, MailboxService } from "./service";
 
 export interface CoreEnv {
-  readonly DB: D1Database;
-  readonly MXROUTE_SERVER: string;
-  readonly MXROUTE_USERNAME: string;
-  readonly MXROUTE_API_KEY: string;
-  readonly TOKEN_PEPPER: string;
-  readonly ENC_KEY_V1: string;
+  readonly DB: D1Database; readonly MXROUTE_SERVER: string; readonly MXROUTE_USERNAME: string;
+  readonly MXROUTE_API_KEY: string; readonly TOKEN_PEPPER: string; readonly ENC_KEY_V1: string;
   readonly MXROUTE_FETCH?: Fetcher;
 }
 
-export class CoreService extends WorkerEntrypoint<CoreEnv> {
-  generateMailbox(rawToken: string): Promise<GenerateResult> {
-    const repository = new Repository(this.env.DB);
-    const mxroute = new MxrouteClient({
-      server: this.env.MXROUTE_SERVER,
-      username: this.env.MXROUTE_USERNAME,
-      apiKey: this.env.MXROUTE_API_KEY,
-    }, this.mxrouteDependencies());
-    return new MailboxService({
-      repository,
-      mxroute,
-      tokenPepper: this.env.TOKEN_PEPPER,
-      encryptionKey: this.env.ENC_KEY_V1,
-      encryptionKeyVersion: 1,
-    }).generateMailbox(rawToken);
-  }
-
-  pageMailboxes(identity: AdminIdentity, options: PageMailboxesOptions = {}): Promise<MailboxPage> {
-    return this.administration().pageMailboxes(identity, options);
-  }
-
-  listDomains(identity: AdminIdentity): Promise<readonly DomainRecord[]> { return this.administration().listDomains(identity); }
-  getSettings(identity: AdminIdentity): Promise<RepositorySettings> { return this.administration().getSettings(identity); }
-  listApiTokens(identity: AdminIdentity): Promise<readonly import("./repository").ApiTokenRecord[]> { return this.administration().listApiTokens(identity); }
-
-  revealPassword(identity: AdminIdentity, publicId: string): Promise<{ password: string; requestId: string }> {
-    return this.administration().revealPassword(identity, publicId);
-  }
-
-  resetPassword(identity: AdminIdentity, publicId: string): Promise<{ password: string; requestId: string }> {
-    return this.administration().resetPassword(identity, publicId);
-  }
-
-  deleteMailbox(identity: AdminIdentity, publicId: string, confirmationEmail: string): Promise<{ requestId: string }> {
-    return this.administration().deleteMailbox(identity, publicId, confirmationEmail);
-  }
-
-  syncDomains(identity: AdminIdentity): Promise<readonly DomainRecord[]> {
-    return this.administration().syncDomains(identity);
-  }
-
-  setDefaultDomain(identity: AdminIdentity, domain: string): Promise<{ requestId: string }> {
-    return this.administration().setDefaultDomain(identity, domain);
-  }
-
-  createApiToken(identity: AdminIdentity, name: string): Promise<{ id: string; rawToken: string; requestId: string }> {
-    return this.administration().createApiToken(identity, name);
-  }
-
-  revokeApiToken(identity: AdminIdentity, id: string): Promise<{ requestId: string }> {
-    return this.administration().revokeApiToken(identity, id);
-  }
-
-  async updateSettings(identity: AdminIdentity, patch: AdminSettingsPatch): Promise<RepositorySettings & { requestId: string }> {
-    const result = await this.administration().updateSettings(identity, patch);
-    return { ...await new Repository(this.env.DB).getSettings(), requestId: result.requestId };
-  }
-
-  pageAudit(identity: AdminIdentity, options: PageAuditOptions = {}): Promise<AuditPage> {
-    return this.administration().pageAudit(identity, options);
-  }
-
-  async scheduled(_controller: ScheduledController): Promise<void> {
-    await this.administration().reconcileAll();
-  }
-
-  private administration(): AdministrationService {
-    return new AdministrationService({
-      repository: new Repository(this.env.DB),
-      mxroute: new MxrouteClient({
-        server: this.env.MXROUTE_SERVER,
-        username: this.env.MXROUTE_USERNAME,
-        apiKey: this.env.MXROUTE_API_KEY,
-      }, this.mxrouteDependencies()),
-      tokenPepper: this.env.TOKEN_PEPPER,
-      encryptionKeys: { 1: this.env.ENC_KEY_V1 },
-      encryptionKeyVersion: 1,
-    });
-  }
-
-  private mxrouteDependencies(): import("./mxroute").MxrouteClientDependencies {
-    return this.env.MXROUTE_FETCH === undefined ? {} : {
-      fetch: async (input, init) => {
-        const response = await this.env.MXROUTE_FETCH!.fetch(input, init);
-        if (response.headers.get("X-Integration-Fault") === "timeout") {
-          throw new DOMException("injected timeout", "AbortError");
-        }
+function mxroute(env: CoreEnv): MxrouteClient {
+  return new MxrouteClient({ server: env.MXROUTE_SERVER, username: env.MXROUTE_USERNAME, apiKey: env.MXROUTE_API_KEY },
+      env.MXROUTE_FETCH === undefined ? {} : { fetch: async (input, init) => {
+        const response = await env.MXROUTE_FETCH!.fetch(input, init);
+        if (response.headers.get("X-Integration-Fault") === "timeout") throw new DOMException("injected timeout", "AbortError");
         return response;
-      },
-    };
+      }});
+}
+function administration(env: CoreEnv): AdministrationService {
+  return new AdministrationService({ repository: new Repository(env.DB), mxroute: mxroute(env), tokenPepper: env.TOKEN_PEPPER,
+    encryptionKeys: { 1: env.ENC_KEY_V1 }, encryptionKeyVersion: 1 });
+}
+
+export class GeneratorEntrypoint extends WorkerEntrypoint<CoreEnv> {
+  generateMailbox(rawToken: string): Promise<GenerateResult> {
+    return new MailboxService({ repository: new Repository(this.env.DB), mxroute: mxroute(this.env), tokenPepper: this.env.TOKEN_PEPPER,
+      encryptionKey: this.env.ENC_KEY_V1, encryptionKeyVersion: 1 }).generateMailbox(rawToken);
   }
 }
 
-export default CoreService;
+export class AdminEntrypoint extends WorkerEntrypoint<CoreEnv> {
+  pageMailboxes(identity: AdminIdentity, options: PageMailboxesOptions = {}): Promise<MailboxPage> { return administration(this.env).pageMailboxes(identity, options); }
+  listDomains(identity: AdminIdentity): Promise<readonly DomainRecord[]> { return administration(this.env).listDomains(identity); }
+  getSettings(identity: AdminIdentity): Promise<RepositorySettings> { return administration(this.env).getSettings(identity); }
+  listApiTokens(identity: AdminIdentity): Promise<readonly import("./repository").ApiTokenRecord[]> { return administration(this.env).listApiTokens(identity); }
+  revealPassword(identity: AdminIdentity, publicId: string): Promise<{ password: string; requestId: string }> { return administration(this.env).revealPassword(identity, publicId); }
+  resetPassword(identity: AdminIdentity, publicId: string): Promise<{ password: string; requestId: string }> { return administration(this.env).resetPassword(identity, publicId); }
+  deleteMailbox(identity: AdminIdentity, publicId: string, confirmationEmail: string): Promise<{ requestId: string }> { return administration(this.env).deleteMailbox(identity, publicId, confirmationEmail); }
+  syncDomains(identity: AdminIdentity): Promise<readonly DomainRecord[]> { return administration(this.env).syncDomains(identity); }
+  setDefaultDomain(identity: AdminIdentity, domain: string): Promise<{ requestId: string }> { return administration(this.env).setDefaultDomain(identity, domain); }
+  createApiToken(identity: AdminIdentity, name: string, operationId: string): Promise<{ id: string; rawToken: string; requestId: string; expiresAt: string }> { return administration(this.env).createApiToken(identity, name, operationId); }
+  acknowledgeApiToken(identity: AdminIdentity, id: string, operationId: string): Promise<{ requestId: string }> { return administration(this.env).acknowledgeApiToken(identity, id, operationId); }
+  revokeApiToken(identity: AdminIdentity, id: string): Promise<{ requestId: string }> { return administration(this.env).revokeApiToken(identity, id); }
+  async updateSettings(identity: AdminIdentity, patch: AdminSettingsPatch): Promise<RepositorySettings & { requestId: string }> {
+    const result = await administration(this.env).updateSettings(identity, patch);
+    return { ...await new Repository(this.env.DB).getSettings(), requestId: result.requestId };
+  }
+  pageAudit(identity: AdminIdentity, options: PageAuditOptions = {}): Promise<AuditPage> { return administration(this.env).pageAudit(identity, options); }
+}
+
+export default class ScheduledEntrypoint extends WorkerEntrypoint<CoreEnv> {
+  async scheduled(_controller: ScheduledController): Promise<void> { await administration(this.env).reconcileAll(); }
+}

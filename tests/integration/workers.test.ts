@@ -45,10 +45,9 @@ describe.sequential("three Worker integration", () => {
             MXROUTE_API_KEY: "mx-secret", TOKEN_PEPPER: PEPPER, ENC_KEY_V1: KEY,
           },
         },
-        { configPath: "workers/generator/wrangler.jsonc", bindingOverrides: { CORE: "bitwarden-mxroute-core" } },
+        { configPath: "workers/generator/wrangler.jsonc" },
         {
           configPath: "workers/admin/wrangler.jsonc",
-          bindingOverrides: { CORE: "bitwarden-mxroute-core" },
           vars: {
             ACCESS_TEAM_DOMAIN: "https://team.cloudflareaccess.com", ACCESS_AUD: "admin-aud",
             ADMIN_EMAILS: "admin@example.com", ADMIN_ORIGIN: ORIGIN,
@@ -65,12 +64,10 @@ describe.sequential("three Worker integration", () => {
     mx = await server.getWorker("integration-mxroute").getExport() as unknown as typeof mx;
     await core.applyD1Migrations("DB" as never);
     db = (await core.getEnv() as CoreEnv).DB;
-    const rpc = await core.getExport() as unknown as {
-      syncDomains(identity: typeof ADMIN): Promise<unknown>;
-      setDefaultDomain(identity: typeof ADMIN, domain: string): Promise<unknown>;
-    };
-    await rpc.syncDomains(ADMIN);
-    await rpc.setDefaultDomain(ADMIN, "example.com");
+    const setupCsrf = await csrf();
+    const sync = await adminMutation("/api/domains/sync", "POST", {}, setupCsrf.csrfToken, setupCsrf.cookie);
+    expect(sync.status, await sync.clone().text()).toBe(200);
+    expect((await adminMutation("/api/domains/default", "PUT", { domain: "example.com" }, setupCsrf.csrfToken, setupCsrf.cookie)).status).toBe(200);
   });
 
   afterAll(async () => {
@@ -126,6 +123,17 @@ describe.sequential("three Worker integration", () => {
     await revokeTokenByRawName("bitwarden-primary");
   });
 
+  it("binds Generator to a least-privilege entrypoint while Admin routes retain management capability", async () => {
+    const binding = (await generator.getEnv() as unknown as { CORE: Record<string, (...args: unknown[]) => Promise<unknown>> }).CORE;
+    expect(() => binding.revealPassword!(ADMIN, "missing")).toThrow(/does not implement/);
+    expect(() => binding.resetPassword!(ADMIN, "missing")).toThrow(/does not implement/);
+    expect(() => binding.deleteMailbox!(ADMIN, "missing", "missing@example.com")).toThrow(/does not implement/);
+    expect(() => binding.administration!()).toThrow(/does not implement/);
+    expect(() => binding.mailbox!()).toThrow(/does not implement/);
+    const response = await adminRequest("/api/settings");
+    expect(response.status).toBe(200);
+  });
+
   it("maps conflict, provider throttling, revoked credentials, and forged Access assertions without credential leakage", async () => {
     const created = await createToken("failure-token");
     for (const [failure, expected] of [["conflict", 503], ["rate", 503]] as const) {
@@ -140,8 +148,8 @@ describe.sequential("three Worker integration", () => {
       expect(text).not.toContain(attemptedPassword);
     }
     await setMxMode("ok");
-    const rpc = await core.getExport() as unknown as { revokeApiToken(identity: typeof ADMIN, id: string): Promise<unknown> };
-    await rpc.revokeApiToken(ADMIN, created.id);
+    const revokeCsrf = await csrf();
+    await adminMutation(`/api/tokens/${created.id}`, "DELETE", {}, revokeCsrf.csrfToken, revokeCsrf.cookie);
     expect((await generate(created.rawToken)).status).toBe(401);
     const attacker = await accessFixture();
     const forged = await attacker.issue();
@@ -235,17 +243,21 @@ describe.sequential("three Worker integration", () => {
   });
 
   async function createToken(name: string): Promise<{ id: string; rawToken: string }> {
-    const rpc = await core.getExport() as unknown as {
-      createApiToken(identity: typeof ADMIN, name: string): Promise<{ id: string; rawToken: string }>;
-    };
-    return rpc.createApiToken(ADMIN, name);
+    const operationId = `operation-${name.replace(/[^A-Za-z0-9_-]/g, "-")}-0001`;
+    const session = await csrf();
+    const response = await adminMutation("/api/tokens", "POST", { name, operationId }, session.csrfToken, session.cookie);
+    expect(response.status).toBe(200);
+    const created = await response.json() as { id: string; rawToken: string };
+    const acknowledged = await adminMutation(`/api/tokens/${created.id}/acknowledge`, "POST", { operationId }, session.csrfToken, session.cookie);
+    expect(acknowledged.status).toBe(200);
+    return created;
   }
 
   async function revokeTokenByRawName(name: string): Promise<void> {
     const row = await db.prepare("SELECT id FROM api_tokens WHERE name=? AND revoked_at IS NULL").bind(name).first<{ id: string }>();
     if (row !== null) {
-      const rpc = await core.getExport() as unknown as { revokeApiToken(identity: typeof ADMIN, id: string): Promise<unknown> };
-      await rpc.revokeApiToken(ADMIN, row.id);
+      const session = await csrf();
+      await adminMutation(`/api/tokens/${row.id}`, "DELETE", {}, session.csrfToken, session.cookie);
     }
   }
 

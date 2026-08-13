@@ -16,6 +16,16 @@ Bitwarden -> Generator Worker -> Core Worker -> MXroute / D1
 Browser   -> Access -> Admin Worker -> Core Worker
 ```
 
+Security note: Core exposes separate least-privilege RPC surfaces. Generator binds only to
+`GeneratorEntrypoint`, Admin binds only to `AdminEntrypoint`, and the default export only runs
+scheduled recovery. Do not remove the `services[].entrypoint` selectors.
+
+API-token issuance is two phase. The browser reuses a client operation ID after a lost response;
+Core retains the pending raw token only as AES-GCM ciphertext for ten minutes. Copying or explicitly
+accepting it acknowledges the token, atomically erases the ciphertext, and activates authentication.
+Unacknowledged tokens cannot authenticate and cron revokes expired pending records. A known token ID
+is revoked with a same-origin keepalive request during page unload.
+
 Generator 和 Admin 只有 Core 服务绑定；D1、MXroute 凭据、Token pepper 和 AES 密钥仅存在于无公网路由的 Core。Admin Worker 还会自行验证 Access JWT、允许的邮箱、Origin 和双提交 CSRF。
 
 ## 本地验证

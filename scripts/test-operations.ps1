@@ -32,6 +32,9 @@ foreach ($text in @($bootstrap, $secrets)) {
 foreach ($required in @('.wrangler/environments', "ValidateSet('Prepare', 'Finalize')", 'Assert-EnvironmentConfigs', 'Deploy private Core shell')) {
     if (-not $bootstrap.Contains($required)) { throw "Missing bootstrap control: $required" }
 }
+foreach ($required in @('GeneratorEntrypoint', 'AdminEntrypoint')) {
+    if (-not $bootstrap.Contains($required) -or -not $secrets.Contains($required)) { throw "Missing least-privilege Core entrypoint control: $required" }
+}
 foreach ($required in @("'secret', 'list'", 'RedirectStandardInput', 'RandomNumberGenerator', 'ShouldProcess')) {
     if (-not $secrets.Contains($required)) { throw "Missing secret control: $required" }
 }
@@ -87,5 +90,10 @@ if ($null -ne $prepareCore.PSObject.Properties['routes'] -or $null -ne $prepareC
 Write-EnvironmentConfigs -DatabaseId $testDatabaseId -Final
 $validatedDatabaseId = Assert-EnvironmentConfigs -RequireFinal
 if ($validatedDatabaseId -ne $testDatabaseId) { throw 'Generated config D1 identity regression.' }
+$generatedGenerator = Get-Content -LiteralPath $script:GeneratorConfig -Raw | ConvertFrom-Json
+$generatedAdmin = Get-Content -LiteralPath $script:AdminConfig -Raw | ConvertFrom-Json
+if ($generatedGenerator.services[0].entrypoint -ne 'GeneratorEntrypoint' -or $generatedAdmin.services[0].entrypoint -ne 'AdminEntrypoint') {
+    throw 'Generated Core service capability split regression.'
+}
 
 Write-Host 'Operations static safety checks: PASS'

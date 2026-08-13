@@ -61,7 +61,8 @@ function coreDouble() {
     setDefaultDomain: vi.fn(async () => ({ requestId: "r4" })),
     getSettings: vi.fn(async () => ({ defaultDomain: null, mailboxQuotaMb: 100, prefixLength: 12, dailyCreationLimit: 30, totalManagedLimit: 500, generationEnabled: true })),
     updateSettings: vi.fn(async () => ({ requestId: "r5" })),
-    listApiTokens: vi.fn(async () => []), createApiToken: vi.fn(async () => ({ id: "t1", rawToken: "raw", requestId: "r6" })),
+    listApiTokens: vi.fn(async () => []), createApiToken: vi.fn(async () => ({ id: "t1", rawToken: "raw", requestId: "r6", expiresAt: "2026-08-13T10:20:00.000Z" })),
+    acknowledgeApiToken: vi.fn(async () => ({ requestId: "r7" })),
     revokeApiToken: vi.fn(async () => ({ requestId: "r7" })),
     pageAudit: vi.fn(async () => ({ items: [], nextCursor: null })),
   };
@@ -142,7 +143,8 @@ describe("Admin worker", () => {
     const cases: [string,string,unknown,ReturnType<typeof vi.fn>][] = [
       ["/api/mailboxes/m1/reveal","POST",{},s.CORE.revealPassword], ["/api/mailboxes/m1/reset","POST",{},s.CORE.resetPassword], ["/api/mailboxes/m1","DELETE",{ confirmationEmail:" a@example.com " },s.CORE.deleteMailbox],
       ["/api/domains/sync","POST",{},s.CORE.syncDomains], ["/api/domains/default","PUT",{ domain:"example.com" },s.CORE.setDefaultDomain], ["/api/settings","PUT",{ mailboxQuotaMb:100 },s.CORE.updateSettings],
-      ["/api/tokens","POST",{ name:"phone" },s.CORE.createApiToken], ["/api/tokens/t1","DELETE",{},s.CORE.revokeApiToken],
+      ["/api/tokens","POST",{ name:"phone", operationId:"operation-phone-0001" },s.CORE.createApiToken], ["/api/tokens/t1","DELETE",{},s.CORE.revokeApiToken],
+      ["/api/tokens/t1/acknowledge","POST",{ operationId:"operation-phone-0001" },s.CORE.acknowledgeApiToken],
     ];
     for (const [path,method,body,spy] of cases) { const response=await mutate(s,path,method,body); expect(response.status).toBe(200); expect(spy).toHaveBeenCalled(); expect(response.headers.get("Cache-Control")).toBe("no-store"); }
     expect(s.CORE.deleteMailbox).toHaveBeenCalledWith(id,"m1"," a@example.com ");
@@ -151,7 +153,7 @@ describe("Admin worker", () => {
     expect(s.CORE.syncDomains).toHaveBeenCalledWith(id);
     expect(s.CORE.setDefaultDomain).toHaveBeenCalledWith(id,"example.com");
     expect(s.CORE.updateSettings).toHaveBeenCalledWith(id,{ mailboxQuotaMb:100 });
-    expect(s.CORE.createApiToken).toHaveBeenCalledWith(id,"phone");
+    expect(s.CORE.createApiToken).toHaveBeenCalledWith(id,"phone","operation-phone-0001");
     expect(s.CORE.revokeApiToken).toHaveBeenCalledWith(id,"t1");
   });
   it("rejects missing confirmations, unexpected/invalid values, oversized bodies, methods and paths", async () => {
@@ -170,7 +172,7 @@ describe("Admin worker", () => {
   it.each([
     ["CONFIRMATION_MISMATCH", "/api/mailboxes/m1", "DELETE", { confirmationEmail:"x@example.com" }, 400, false],
     ["INVALID_STATE", "/api/mailboxes/m1/reveal", "POST", {}, 409, false],
-    ["TOKEN_LIMIT", "/api/tokens", "POST", { name:"phone" }, 409, false],
+    ["TOKEN_LIMIT", "/api/tokens", "POST", { name:"phone", operationId:"operation-phone-0001" }, 409, false],
     ["MX_TIMEOUT", "/api/mailboxes/m1/reset", "POST", {}, 503, true],
     ["NOT_FOUND", "/api/mailboxes/m1/reveal", "POST", {}, 404, false],
   ])("maps sanitized Core error %s", async (code,path,method,body,status,retryable) => {

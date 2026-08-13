@@ -50,6 +50,9 @@ function Assert-EnvironmentConfigs {
         $binding = @($publicWorker.services | Where-Object { $_.binding -eq 'CORE' })
         if ($binding.Count -ne 1 -or $binding[0].service -ne $script:CoreName) { throw 'CORE service target mismatch.' }
     }
+    if ($generator.services[0].entrypoint -ne 'GeneratorEntrypoint' -or $admin.services[0].entrypoint -ne 'AdminEntrypoint') {
+        throw 'CORE service entrypoint mismatch.'
+    }
     $db = @($core.d1_databases | Where-Object { $_.binding -eq 'DB' })
     $validDatabaseId = $db.Count -eq 1 -and $db[0].database_id -match '^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$' -and $db[0].database_id -ne '00000000-0000-0000-0000-000000000000'
     if ($db.Count -ne 1 -or $db[0].database_name -ne $script:DatabaseName -or -not $validDatabaseId) {

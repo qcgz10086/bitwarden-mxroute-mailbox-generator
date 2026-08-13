@@ -106,7 +106,7 @@ function Write-EnvironmentConfigs {
         compatibility_date = '2026-08-13'
         workers_dev = $false
         account_id = $script:AccountIdLower
-        services = @([ordered]@{ binding = 'CORE'; service = $script:Names.Core })
+        services = @([ordered]@{ binding = 'CORE'; service = $script:Names.Core; entrypoint = 'GeneratorEntrypoint' })
         ratelimits = @(
             [ordered]@{ name = 'PREAUTH_RATE_LIMITER'; namespace_id = [string]($namespaceBase + 1); simple = [ordered]@{ limit = 30; period = 60 } },
             [ordered]@{ name = 'TOKEN_RATE_LIMITER'; namespace_id = [string]($namespaceBase + 2); simple = [ordered]@{ limit = 5; period = 60 } }
@@ -118,7 +118,7 @@ function Write-EnvironmentConfigs {
         compatibility_date = '2026-08-13'
         workers_dev = $false
         account_id = $script:AccountIdLower
-        services = @([ordered]@{ binding = 'CORE'; service = $script:Names.Core })
+        services = @([ordered]@{ binding = 'CORE'; service = $script:Names.Core; entrypoint = 'AdminEntrypoint' })
         assets = [ordered]@{
             directory = "$relativeRoot/workers/admin/public"
             binding = 'ASSETS'
@@ -160,6 +160,9 @@ function Assert-EnvironmentConfigs {
         if ($serialized -match 'DB|MXROUTE_SERVER|MXROUTE_USERNAME|MXROUTE_API_KEY|TOKEN_PEPPER|ENC_KEY_V1') {
             throw 'A public Worker config contains a Core-only binding.'
         }
+    }
+    if ($generator.services[0].entrypoint -ne 'GeneratorEntrypoint' -or $admin.services[0].entrypoint -ne 'AdminEntrypoint') {
+        throw 'Core service bindings must select their least-privilege named entrypoint.'
     }
     $db = @($core.d1_databases | Where-Object { $_.binding -eq 'DB' })
     if ($db.Count -ne 1 -or $db[0].database_name -ne $script:Names.Database) { throw 'D1 binding name mismatch.' }
