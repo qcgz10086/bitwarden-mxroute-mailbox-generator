@@ -516,4 +516,33 @@ describe("D1 repository", () => {
       .bind("audit_stale").first<{ id: string }>();
     expect(audit).toBeNull();
   });
+
+  it("rolls back token creation when its required audit insertion fails", async () => {
+    const repository = new Repository(env.DB);
+    const audit = {
+      id: "duplicate-audit", actorType: "admin", actorId: "subject", actorEmail: "admin@example.test",
+      action: "token.create", email: null, result: "success", errorCode: null,
+      requestId: "request-1", createdAt: NOW,
+    };
+    await repository.appendAudit(audit);
+    await expect(repository.createTokenDigestWithAudit({
+      id: "token-atomic", name: "Atomic", digest: new Uint8Array([8]), createdAt: NOW,
+    }, audit)).rejects.toThrow();
+    expect(await env.DB.prepare("SELECT id FROM api_tokens WHERE id = 'token-atomic'").first()).toBeNull();
+  });
+
+  it("rolls back pending failure and reservation release when audit insertion fails", async () => {
+    const repository = new Repository(env.DB);
+    await prepareReservation(repository);
+    await repository.reservePendingMailbox(mailboxInput());
+    const audit = {
+      id: "duplicate-audit", actorType: "system", actorId: "scheduled", actorEmail: null,
+      action: "mailbox.create.reconcile", email: `alpha@${DOMAIN}`, result: "failure",
+      errorCode: "MX_NOT_FOUND", requestId: "request-1", createdAt: NOW,
+    };
+    await repository.appendAudit(audit);
+    await expect(repository.failPendingMailboxWithAudit("mbx_01", "MX_NOT_FOUND", LATER, audit)).rejects.toThrow();
+    expect((await repository.findMailbox("mbx_01"))?.status).toBe("pending");
+    expect((await env.DB.prepare("SELECT count FROM creation_counters WHERE token_id = ?").bind(TOKEN_ID).first<{ count: number }>())?.count).toBe(1);
+  });
 });

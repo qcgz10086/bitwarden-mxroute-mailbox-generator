@@ -253,6 +253,7 @@ export type AdminErrorCode = ServiceErrorCode
   | "NOT_FOUND"
   | "INVALID_STATE"
   | "INVALID_SETTINGS"
+  | "INVALID_INPUT"
   | "INACTIVE_DOMAIN"
   | "CONFIRMATION_MISMATCH"
   | "TOKEN_LIMIT"
@@ -303,28 +304,28 @@ export class AdministrationService {
     this.createId = dependencies.createId ?? ((kind) => `${kind}_${crypto.randomUUID()}`);
   }
 
-  pageMailboxes(_identity: AdminIdentity, options: PageMailboxesOptions = {}): Promise<MailboxPage> {
-    return this.dependencies.repository.pageMailboxes(options);
+  async pageMailboxes(_identity: AdminIdentity, options: PageMailboxesOptions = {}): Promise<MailboxPage> {
+    try { return await this.dependencies.repository.pageMailboxes(options); }
+    catch (error) { throw new AdminError(repositoryAdminCode(error), this.createId("request")); }
   }
 
-  pageAudit(_identity: AdminIdentity, options: PageAuditOptions = {}): Promise<AuditPage> {
-    return this.dependencies.repository.pageAudit(options);
+  async pageAudit(_identity: AdminIdentity, options: PageAuditOptions = {}): Promise<AuditPage> {
+    try { return await this.dependencies.repository.pageAudit(options); }
+    catch (error) { throw new AdminError(repositoryAdminCode(error), this.createId("request")); }
   }
 
   async revealPassword(identity: AdminIdentity, publicId: string): Promise<{ password: string; requestId: string }> {
     const requestId = this.createId("request");
-    const mailbox = await this.requireMailbox(publicId, requestId, identity, "mailbox.reveal");
-    if (!["active", "reset_unknown", "delete_failed"].includes(mailbox.status)) {
-      await this.audit(identity, "mailbox.reveal", mailbox.email, "failure", "INVALID_STATE", requestId);
-      throw new AdminError("INVALID_STATE", requestId);
-    }
     try {
+      const mailbox = await this.dependencies.repository.authorizePasswordRevealWithAudit(
+        publicId, this.adminEvent(identity,"mailbox.reveal",null,"success",null,requestId),
+      );
       const password = await this.decrypt(mailbox, mailbox.status === "reset_unknown", requestId);
-      await this.audit(identity, "mailbox.reveal", mailbox.email, "success", null, requestId);
       return { password, requestId };
-    } catch {
-      await this.audit(identity, "mailbox.reveal", mailbox.email, "failure", "INTERNAL_ERROR", requestId);
-      throw new AdminError("INTERNAL_ERROR", requestId);
+    } catch (error) {
+      const code = error instanceof RepositoryError && error.code === "INVALID_STATE" ? "INVALID_STATE" : "INTERNAL_ERROR";
+      await this.audit(identity, "mailbox.reveal", null, "failure", code, requestId);
+      throw new AdminError(code, requestId);
     }
   }
 
@@ -363,21 +364,25 @@ export class AdministrationService {
           result: "success", errorCode: null, requestId, createdAt: now,
         });
       } catch {
-        await this.dependencies.repository.markResetUnknown(publicId, "INTERNAL_ERROR", now);
-        await this.audit(identity, "mailbox.reset", mailbox.email, "failure", "INTERNAL_ERROR", requestId);
+        await this.dependencies.repository.markResetUnknownWithAudit(publicId,"INTERNAL_ERROR",now,
+          this.adminEvent(identity,"mailbox.reset",mailbox.email,"failure","INTERNAL_ERROR",requestId));
         throw new AdminError("INTERNAL_ERROR", requestId, true);
       }
       return { password, requestId };
     } catch (error) {
       if (error instanceof AdminError) throw error;
       const code = serviceCode(error);
-      if (code === null) throw new AdminError("INTERNAL_ERROR", requestId, true);
-      if (isAmbiguous(code)) {
-        await this.dependencies.repository.markResetUnknown(publicId, code, now);
-      } else {
-        await this.dependencies.repository.rollbackPasswordReset(publicId, code, now);
+      if (code === null) {
+        await this.audit(identity,"mailbox.reset",mailbox.email,"failure","INTERNAL_ERROR",requestId);
+        throw new AdminError("INTERNAL_ERROR", requestId, true);
       }
-      await this.audit(identity, "mailbox.reset", mailbox.email, "failure", code, requestId);
+      if (isAmbiguous(code)) {
+        await this.dependencies.repository.markResetUnknownWithAudit(publicId,code,now,
+          this.adminEvent(identity,"mailbox.reset",mailbox.email,"failure",code,requestId));
+      } else {
+        await this.dependencies.repository.rollbackPasswordResetWithAudit(publicId,code,now,
+          this.adminEvent(identity,"mailbox.reset",mailbox.email,"failure",code,requestId));
+      }
       throw new AdminError(code, requestId, isAmbiguous(code));
     }
   }
@@ -423,15 +428,19 @@ export class AdministrationService {
           return { requestId };
         }
         if (existence === true) {
-          await this.dependencies.repository.markDeleteFailed(publicId, code, now);
+          await this.dependencies.repository.markDeleteFailedWithAudit(publicId,code,now,
+            this.adminEvent(identity,"mailbox.delete",mailbox.email,"failure",code,requestId));
         } else {
           await this.dependencies.repository.recordRecoveryAttempt(publicId, "deleting", now);
         }
       } else if (code !== null) {
-        await this.dependencies.repository.markDeleteFailed(publicId, code, now);
+        await this.dependencies.repository.markDeleteFailedWithAudit(publicId,code,now,
+          this.adminEvent(identity,"mailbox.delete",mailbox.email,"failure",code,requestId));
       }
       const normalized = code ?? "INTERNAL_ERROR";
-      await this.audit(identity, "mailbox.delete", mailbox.email, "failure", normalized, requestId);
+      if (code === null || (code !== null && isAmbiguous(code) && await this.dependencies.repository.findMailbox(publicId).then(r => r?.status === "deleting"))) {
+        await this.audit(identity, "mailbox.delete", mailbox.email, "failure", normalized, requestId);
+      }
       throw new AdminError(normalized, requestId, code !== null && isAmbiguous(code));
     }
   }
@@ -441,8 +450,8 @@ export class AdministrationService {
     const now = this.now().toISOString();
     try {
       const domains = await this.dependencies.mxroute.listDomains();
-      await this.dependencies.repository.syncDomains(domains, now);
-      await this.audit(identity, "domains.sync", null, "success", null, requestId);
+      await this.dependencies.repository.syncDomainsWithAudit(domains,now,
+        this.adminEvent(identity,"domains.sync",null,"success",null,requestId));
       return this.dependencies.repository.listDomains();
     } catch (error) {
       const code = serviceCode(error) ?? "INTERNAL_ERROR";
@@ -452,15 +461,15 @@ export class AdministrationService {
   }
 
   async setDefaultDomain(identity: AdminIdentity, domain: string): Promise<{ requestId: string }> {
-    return this.adminMutation(identity, "domains.default", domain, async () => {
-      await this.dependencies.repository.setDefaultDomain(domain);
+    return this.adminMutation(identity, "domains.default", domain, async (event) => {
+      await this.dependencies.repository.setDefaultDomainWithAudit(domain,event);
     });
   }
 
   async updateSettings(identity: AdminIdentity, patch: AdminSettingsPatch): Promise<{ requestId: string }> {
-    return this.adminMutation(identity, "settings.update", null, async () => {
+    return this.adminMutation(identity, "settings.update", null, async (event) => {
       validateSettings(patch);
-      await this.dependencies.repository.updateSettings(patch);
+      await this.dependencies.repository.updateSettingsWithAudit(patch,event);
     });
   }
 
@@ -474,10 +483,9 @@ export class AdministrationService {
     const id = this.createId("token");
     const now = this.now().toISOString();
     try {
-      await this.dependencies.repository.createTokenDigest({
+      await this.dependencies.repository.createTokenDigestWithAudit({
         id, name: name.trim(), digest: await tokenHmac(rawToken, this.dependencies.tokenPepper), createdAt: now,
-      });
-      await this.audit(identity, "token.create", null, "success", null, requestId);
+      }, this.adminEvent(identity,"token.create",null,"success",null,requestId));
       return { id, rawToken, requestId };
     } catch (error) {
       const code = error instanceof RepositoryError && error.code === "TOKEN_LIMIT"
@@ -489,8 +497,8 @@ export class AdministrationService {
   }
 
   revokeApiToken(identity: AdminIdentity, id: string): Promise<{ requestId: string }> {
-    return this.adminMutation(identity, "token.revoke", null, async () => {
-      await this.dependencies.repository.revokeToken(id, this.now().toISOString());
+    return this.adminMutation(identity, "token.revoke", null, async (event) => {
+      await this.dependencies.repository.revokeTokenWithAudit(id,this.now().toISOString(),event);
     });
   }
 
@@ -499,7 +507,7 @@ export class AdministrationService {
   }
 
   async reconcileResetUnknown(): Promise<number> {
-    return this.reconcile(["reset_unknown"]);
+    return this.reconcile(["reset_unknown", "resetting"]);
   }
 
   async reconcileDeleting(): Promise<number> {
@@ -507,10 +515,10 @@ export class AdministrationService {
   }
 
   async reconcileAll(): Promise<number> {
-    return this.reconcile(["pending", "reset_unknown", "deleting"]);
+    return this.reconcile(["pending", "reset_unknown", "resetting", "deleting"]);
   }
 
-  private async reconcile(statuses: readonly ("pending" | "reset_unknown" | "deleting")[]): Promise<number> {
+  private async reconcile(statuses: readonly ("pending" | "reset_unknown" | "resetting" | "deleting")[]): Promise<number> {
     const nowDate = this.now();
     const now = nowDate.toISOString();
     const staleBefore = new Date(nowDate.getTime() - 5 * 60_000).toISOString();
@@ -522,12 +530,12 @@ export class AdministrationService {
           if (existence === true) {
             await this.dependencies.repository.activateMailboxWithAudit(mailbox.publicId, now, this.systemAudit("mailbox.create.reconcile", mailbox.email, "success", null, now));
           } else if (existence === false) {
-            await this.dependencies.repository.failPendingMailbox(mailbox.publicId, "MX_NOT_FOUND", now);
-            await this.dependencies.repository.appendAudit(this.systemAudit("mailbox.create.reconcile", mailbox.email, "failure", "MX_NOT_FOUND", now));
+            await this.dependencies.repository.failPendingMailboxWithAudit(mailbox.publicId,"MX_NOT_FOUND",now,
+              this.systemAudit("mailbox.create.reconcile",mailbox.email,"failure","MX_NOT_FOUND",now));
           } else {
             await this.dependencies.repository.recordRecoveryAttempt(mailbox.publicId, "pending", now);
           }
-        } else if (mailbox.status === "reset_unknown") {
+        } else if (mailbox.status === "reset_unknown" || mailbox.status === "resetting") {
           const password = await this.decrypt(mailbox, true, this.createId("request"));
           await this.dependencies.mxroute.updateMailbox(mailbox.domain, mailbox.localPart, { password });
           await this.dependencies.repository.completePasswordResetWithAudit(
@@ -540,7 +548,8 @@ export class AdministrationService {
           if (existence === false) {
             await this.dependencies.repository.removeMailboxWithAudit(mailbox.publicId, this.systemAudit("mailbox.delete.reconcile", mailbox.email, "success", null, now));
           } else if (existence === true) {
-            await this.dependencies.repository.markDeleteFailed(mailbox.publicId, "MX_TIMEOUT", now);
+            await this.dependencies.repository.markDeleteFailedWithAudit(mailbox.publicId,"MX_TIMEOUT",now,
+              this.systemAudit("mailbox.delete.reconcile",mailbox.email,"failure","MX_TIMEOUT",now));
           } else {
             await this.dependencies.repository.recordRecoveryAttempt(mailbox.publicId, "deleting", now);
           }
@@ -608,18 +617,22 @@ export class AdministrationService {
     identity: AdminIdentity,
     action: string,
     email: string | null,
-    mutation: () => Promise<void>,
+    mutation: (event: import("./repository").AuditEventInput) => Promise<void>,
   ): Promise<{ requestId: string }> {
     const requestId = this.createId("request");
     try {
-      await mutation();
-      await this.audit(identity, action, email, "success", null, requestId);
+      await mutation(this.adminEvent(identity,action,email,"success",null,requestId));
       return { requestId };
     } catch (error) {
       const code = repositoryAdminCode(error);
       await this.audit(identity, action, email, "failure", code, requestId);
       throw new AdminError(code, requestId);
     }
+  }
+
+  private adminEvent(identity: AdminIdentity, action: string, email: string | null, result: string, errorCode: string | null, requestId: string): import("./repository").AuditEventInput {
+    return { id:this.createId("audit"),actorType:"admin",actorId:identity.subject,actorEmail:identity.email,
+      action,email,result,errorCode,requestId,createdAt:this.now().toISOString() };
   }
 
   private audit(identity: AdminIdentity, action: string, email: string | null, result: string, errorCode: string | null, requestId: string): Promise<void> {
@@ -655,7 +668,7 @@ function validateSettings(patch: AdminSettingsPatch): void {
 
 function repositoryAdminCode(error: unknown): AdminErrorCode {
   if (error instanceof RepositoryError) {
-    if (error.code === "INACTIVE_DOMAIN" || error.code === "INVALID_SETTINGS" || error.code === "INVALID_STATE") {
+    if (error.code === "INACTIVE_DOMAIN" || error.code === "INVALID_SETTINGS" || error.code === "INVALID_STATE" || error.code === "INVALID_INPUT") {
       return error.code;
     }
   }

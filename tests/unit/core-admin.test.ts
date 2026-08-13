@@ -1,5 +1,5 @@
 import { applyD1Migrations, env, type D1Migration } from "cloudflare:test";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AdminIdentity } from "../../packages/contracts/src/index";
 import { decryptPassword, encryptPassword, tokenHmac } from "../../packages/security/src/crypto";
@@ -184,6 +184,15 @@ describe("AdministrationService configuration and tokens", () => {
     expect(audits.nextCursor).not.toBeNull();
     expect(JSON.stringify(audits)).not.toContain(PASSWORD);
   });
+
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects invalid pagination limit %s",
+    async (limit) => {
+      const service = adminService();
+      await expectAdminError(service.pageMailboxes(ADMIN, { limit }), "INVALID_INPUT");
+      await expectAdminError(service.pageAudit(ADMIN, { limit }), "INVALID_INPUT");
+    },
+  );
 });
 
 describe("AdministrationService password state machine", () => {
@@ -229,6 +238,38 @@ describe("AdministrationService password state machine", () => {
     const row = await new Repository(env.DB).findMailbox("mbx-1");
     expect(row?.status).toBe("active");
     expect(await decryptPassword({ encrypted: { ciphertext: row!.passwordCiphertext, nonce: row!.passwordNonce, keyVersion: 1 }, key: ENCRYPTION_KEY, publicId: row!.publicId, email: row!.email })).toBe(CANDIDATE);
+  });
+
+  it("recovers a stale resetting row when promotion and reset_unknown persistence both fail", async () => {
+    await seedMailbox();
+    const repository = new Repository(env.DB);
+    const mxroute = new FakeMxroute();
+    const complete = vi.spyOn(repository, "completePasswordResetWithAudit")
+      .mockRejectedValueOnce(new Error("promotion failed"));
+    const mark = vi.spyOn(repository, "markResetUnknownWithAudit")
+      .mockRejectedValueOnce(new Error("mark failed"));
+    const service = new AdministrationService({
+      repository, mxroute, tokenPepper: TOKEN_PEPPER,
+      encryptionKeys: { 1: ENCRYPTION_KEY }, encryptionKeyVersion: 1,
+      now: () => new Date(NOW), randomMailboxPassword: () => CANDIDATE,
+      createId: (kind) => `${kind}-${crypto.randomUUID()}`,
+    });
+
+    await expectAdminError(service.resetPassword(ADMIN, "mbx-1"), "INTERNAL_ERROR");
+    expect((await repository.findMailbox("mbx-1"))?.status).toBe("resetting");
+    complete.mockRestore();
+    mark.mockRestore();
+    await env.DB.prepare("UPDATE mailboxes SET updated_at = ? WHERE public_id = 'mbx-1'").bind(STALE).run();
+    await service.reconcileResetUnknown();
+    expect(mxroute.patches).toEqual([CANDIDATE, CANDIDATE]);
+    expect((await repository.findMailbox("mbx-1"))?.status).toBe("active");
+  });
+
+  it("guards reveal authorization in D1 after a state change", async () => {
+    await seedMailbox();
+    await env.DB.prepare("UPDATE mailboxes SET status = 'deleting' WHERE public_id = 'mbx-1'").run();
+    await expectAdminError(adminService().revealPassword(ADMIN, "mbx-1"), "INVALID_STATE");
+    expect(await env.DB.prepare("SELECT id FROM audit_events WHERE action = 'mailbox.reveal' AND result = 'success'").first()).toBeNull();
   });
 });
 

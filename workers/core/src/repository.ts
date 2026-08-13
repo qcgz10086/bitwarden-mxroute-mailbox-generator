@@ -23,6 +23,7 @@ export type RepositoryErrorCode =
   | "INVALID_STATE"
   | "INVALID_TRANSITION"
   | "INVALID_CURSOR"
+  | "INVALID_INPUT"
   | "INVALID_SETTINGS";
 
 export interface EncryptedValue {
@@ -359,6 +360,28 @@ export class Repository {
     }
   }
 
+  async failPendingMailboxWithAudit(publicId: string, failureCode: string, updatedAt: string, event: AuditEventInput): Promise<void> {
+    await this.mutateWithAudit(this.db.prepare(`UPDATE mailboxes
+      SET status = 'failed', failure_code = ?, updated_at = ?,
+          reservation_date = NULL, reservation_token_id = NULL
+      WHERE public_id = ? AND status = 'pending'`).bind(failureCode, updatedAt, publicId), event);
+  }
+
+  async authorizePasswordRevealWithAudit(publicId: string, event: AuditEventInput): Promise<MailboxRecord> {
+    const [selected, audit] = await this.db.batch([
+      this.db.prepare(`SELECT ${MAILBOX_COLUMNS} FROM mailboxes
+        WHERE public_id = ? AND status IN ('active', 'reset_unknown', 'delete_failed')`).bind(publicId),
+      this.db.prepare(`INSERT INTO audit_events(id,actor_type,actor_id,actor_email,action,email,result,error_code,request_id,created_at)
+        SELECT ?,?,?,?,?,email,?,?,?,? FROM mailboxes
+        WHERE public_id = ? AND status IN ('active', 'reset_unknown', 'delete_failed')`)
+        .bind(event.id,event.actorType,event.actorId,event.actorEmail ?? null,event.action,event.result,event.errorCode,event.requestId,event.createdAt,publicId),
+    ]);
+    requireSingleChange(audit);
+    const row = selected?.results[0] as MailboxRow | undefined;
+    if (row === undefined) throw new RepositoryError("INVALID_STATE");
+    return mapMailbox(row);
+  }
+
   async findMailbox(publicId: string): Promise<MailboxRecord | null> {
     const row = await this.db.prepare(`SELECT ${MAILBOX_COLUMNS}
       FROM mailboxes WHERE public_id = ?`)
@@ -374,7 +397,7 @@ export class Repository {
     if (sortColumn === undefined || (direction !== "asc" && direction !== "desc")) {
       throw new RepositoryError("INVALID_CURSOR");
     }
-    const limit = Math.max(1, Math.min(options.limit ?? 50, 100));
+    const limit = validPageLimit(options.limit);
     const clauses: string[] = [];
     const bindings: unknown[] = [];
 
@@ -517,6 +540,13 @@ export class Repository {
     requireSingleChange(result);
   }
 
+  async rollbackPasswordResetWithAudit(publicId: string, failureCode: string, updatedAt: string, event: AuditEventInput): Promise<void> {
+    await this.mutateWithAudit(this.db.prepare(`UPDATE mailboxes SET
+      next_password_ciphertext=NULL,next_password_nonce=NULL,next_password_key_version=NULL,
+      status='active',failure_code=?,recovery_attempt_count=0,recovery_next_at=NULL,updated_at=?
+      WHERE public_id=? AND status='resetting'`).bind(failureCode,updatedAt,publicId), event);
+  }
+
   async markResetUnknown(publicId: string, failureCode: string, updatedAt: string): Promise<void> {
     const result = await this.db.prepare(`UPDATE mailboxes
       SET status = 'reset_unknown', failure_code = ?, updated_at = ?
@@ -527,6 +557,13 @@ export class Repository {
     requireSingleChange(result);
   }
 
+  async markResetUnknownWithAudit(publicId: string, failureCode: string, updatedAt: string, event: AuditEventInput): Promise<void> {
+    await this.mutateWithAudit(this.db.prepare(`UPDATE mailboxes SET status='reset_unknown',failure_code=?,updated_at=?
+      WHERE public_id=? AND status='resetting' AND next_password_ciphertext IS NOT NULL
+      AND next_password_nonce IS NOT NULL AND next_password_key_version IS NOT NULL`)
+      .bind(failureCode,updatedAt,publicId), event);
+  }
+
   async markDeleteFailed(publicId: string, failureCode: string, updatedAt: string): Promise<void> {
     const result = await this.db.prepare(`UPDATE mailboxes
       SET status = 'delete_failed', failure_code = ?, recovery_attempt_count = 0,
@@ -534,6 +571,12 @@ export class Repository {
       WHERE public_id = ? AND status = 'deleting'`)
       .bind(failureCode, updatedAt, publicId).run();
     requireSingleChange(result);
+  }
+
+  async markDeleteFailedWithAudit(publicId: string, failureCode: string, updatedAt: string, event: AuditEventInput): Promise<void> {
+    await this.mutateWithAudit(this.db.prepare(`UPDATE mailboxes SET status='delete_failed',failure_code=?,
+      recovery_attempt_count=0,recovery_next_at=NULL,updated_at=? WHERE public_id=? AND status='deleting'`)
+      .bind(failureCode,updatedAt,publicId), event);
   }
 
   async removeMailbox(publicId: string): Promise<void> {
@@ -565,6 +608,15 @@ export class Repository {
     await this.db.batch(statements);
   }
 
+  async syncDomainsWithAudit(domains: readonly string[], syncedAt: string, event: AuditEventInput): Promise<void> {
+    const statements = [this.db.prepare("UPDATE domains SET is_active=0,synced_at=?").bind(syncedAt),
+      ...domains.map((domain) => this.db.prepare(`INSERT INTO domains(domain,is_active,synced_at) VALUES(?,1,?)
+        ON CONFLICT(domain) DO UPDATE SET is_active=1,synced_at=excluded.synced_at`).bind(domain,syncedAt)),
+      auditStatement(this.db,event)];
+    const results = await this.db.batch(statements);
+    requireSingleChange(results.at(-1));
+  }
+
   async listDomains(): Promise<readonly DomainRecord[]> {
     const result = await this.db.prepare(`SELECT domain, is_active, synced_at
       FROM domains ORDER BY domain ASC`).all<{ domain: string; is_active: number; synced_at: string }>();
@@ -585,6 +637,16 @@ export class Repository {
       .run();
     if (Number(result.meta.changes ?? 0) !== 1) {
       throw new RepositoryError("INACTIVE_DOMAIN");
+    }
+  }
+
+  async setDefaultDomainWithAudit(domain: string, event: AuditEventInput): Promise<void> {
+    try {
+      await this.mutateWithAudit(this.db.prepare(`INSERT INTO settings(key,value) SELECT 'default_domain',domain
+        FROM domains WHERE domain=? AND is_active=1 ON CONFLICT(key) DO UPDATE SET value=excluded.value`).bind(domain), event);
+    } catch (error) {
+      if (error instanceof RepositoryError && error.code === "INVALID_STATE") throw new RepositoryError("INACTIVE_DOMAIN");
+      throw error;
     }
   }
 
@@ -632,6 +694,12 @@ export class Repository {
     if (statements.length > 0) await this.db.batch(statements);
   }
 
+  async updateSettingsWithAudit(patch: SettingsPatch, event: AuditEventInput): Promise<void> {
+    const statements = settingsStatements(this.db, patch);
+    const results = await this.db.batch([...statements, auditStatement(this.db,event)]);
+    requireSingleChange(results.at(-1));
+  }
+
   async createTokenDigest(input: CreateTokenDigestInput): Promise<void> {
     try {
       await this.db.prepare(`INSERT INTO api_tokens(
@@ -644,6 +712,13 @@ export class Repository {
     }
   }
 
+  async createTokenDigestWithAudit(input: CreateTokenDigestInput, event: AuditEventInput): Promise<void> {
+    try {
+      await this.mutateWithAudit(this.db.prepare(`INSERT INTO api_tokens(id,name,token_hmac,created_at)
+        VALUES(?,?,?,?)`).bind(input.id,input.name,toArrayBuffer(input.digest),input.createdAt), event);
+    } catch (error) { throw normalizeDatabaseError(error); }
+  }
+
   async countActiveTokens(): Promise<number> {
     const row = await this.db.prepare("SELECT COUNT(*) AS count FROM api_tokens WHERE revoked_at IS NULL")
       .first<{ count: number }>();
@@ -654,6 +729,11 @@ export class Repository {
     const result = await this.db.prepare(`UPDATE api_tokens SET revoked_at = ?
       WHERE id = ? AND revoked_at IS NULL`).bind(revokedAt, id).run();
     requireSingleChange(result);
+  }
+
+  async revokeTokenWithAudit(id: string, revokedAt: string, event: AuditEventInput): Promise<void> {
+    await this.mutateWithAudit(this.db.prepare("UPDATE api_tokens SET revoked_at=? WHERE id=? AND revoked_at IS NULL")
+      .bind(revokedAt,id), event);
   }
 
   async verifyTokenDigest(digest: Uint8Array, lastUsedAt: string): Promise<ApiTokenRecord | null> {
@@ -686,7 +766,7 @@ export class Repository {
   }
 
   async pageAudit(options: PageAuditOptions = {}): Promise<AuditPage> {
-    const limit = Math.max(1, Math.min(options.limit ?? 50, 100));
+    const limit = validPageLimit(options.limit);
     let cursorClause = "";
     const bindings: unknown[] = [];
     if (options.cursor !== undefined) {
@@ -747,6 +827,12 @@ export class Repository {
       .bind(now, now, publicId, status).first<{ public_id: string }>();
     if (row === null) throw new RepositoryError("INVALID_STATE");
   }
+
+  private async mutateWithAudit(mutation: D1PreparedStatement, event: AuditEventInput): Promise<void> {
+    const [changed, audit] = await this.db.batch([mutation, auditStatement(this.db,event,true)]);
+    requireSingleChange(changed);
+    requireSingleChange(audit);
+  }
 }
 
 function auditStatement(
@@ -779,6 +865,26 @@ function auditStatement(
       event.requestId,
       event.createdAt,
     );
+}
+
+function settingsStatements(db: D1Database, patch: SettingsPatch): D1PreparedStatement[] {
+  const values: readonly [keyof SettingsPatch, string, string][] = [
+    ["mailboxQuotaMb", "mailbox_quota_mb", String(patch.mailboxQuotaMb)],
+    ["prefixLength", "prefix_length", String(patch.prefixLength)],
+    ["dailyCreationLimit", "daily_creation_limit", String(patch.dailyCreationLimit)],
+    ["totalManagedLimit", "total_managed_limit", String(patch.totalManagedLimit)],
+    ["generationEnabled", "generation_enabled", String(patch.generationEnabled)],
+  ];
+  return values.filter(([property]) => patch[property] !== undefined)
+    .map(([,key,value]) => db.prepare("UPDATE settings SET value=? WHERE key=?").bind(value,key));
+}
+
+function validPageLimit(value: number | undefined): number {
+  const limit = value ?? 50;
+  if (!Number.isFinite(limit) || !Number.isInteger(limit) || limit <= 0) {
+    throw new RepositoryError("INVALID_INPUT");
+  }
+  return Math.min(limit, 100);
 }
 
 function mapMailbox(row: MailboxRow): MailboxRecord {

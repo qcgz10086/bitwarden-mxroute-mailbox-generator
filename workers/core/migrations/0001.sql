@@ -24,7 +24,6 @@ CREATE TABLE mailboxes (
   encryption_key_version INTEGER NOT NULL,
   next_password_ciphertext BLOB,
   next_password_nonce BLOB,
-  next_password_key_version INTEGER,
   quota_mb INTEGER NOT NULL,
   status TEXT NOT NULL CHECK (status IN (
     'pending',
@@ -36,8 +35,6 @@ CREATE TABLE mailboxes (
     'delete_failed'
   )),
   failure_code TEXT,
-  recovery_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (recovery_attempt_count BETWEEN 0 AND 8),
-  recovery_next_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   CHECK (
@@ -69,7 +66,6 @@ CREATE TABLE audit_events (
   id TEXT PRIMARY KEY,
   actor_type TEXT NOT NULL,
   actor_id TEXT NOT NULL,
-  actor_email TEXT,
   action TEXT NOT NULL,
   email TEXT,
   result TEXT NOT NULL,
@@ -114,13 +110,6 @@ WHEN NEW.status = 'pending' AND NOT EXISTS (
     AND count > 0
 )
 BEGIN SELECT RAISE(ABORT, 'RESERVATION_RELEASE'); END;
-
-CREATE TRIGGER enforce_active_token_limit
-BEFORE INSERT ON api_tokens
-WHEN NEW.revoked_at IS NULL AND (
-  SELECT COUNT(*) FROM api_tokens WHERE revoked_at IS NULL
-) >= 2
-BEGIN SELECT RAISE(ABORT, 'TOKEN_LIMIT'); END;
 
 CREATE TRIGGER prevent_pending_reservation_retarget
 BEFORE UPDATE OF reservation_date, reservation_token_id ON mailboxes
