@@ -316,17 +316,29 @@ export class AdministrationService {
 
   async revealPassword(identity: AdminIdentity, publicId: string): Promise<{ password: string; requestId: string }> {
     const requestId = this.createId("request");
-    try {
-      const mailbox = await this.dependencies.repository.authorizePasswordRevealWithAudit(
-        publicId, this.adminEvent(identity,"mailbox.reveal",null,"success",null,requestId),
-      );
-      const password = await this.decrypt(mailbox, mailbox.status === "reset_unknown", requestId);
-      return { password, requestId };
-    } catch (error) {
-      const code = error instanceof RepositoryError && error.code === "INVALID_STATE" ? "INVALID_STATE" : "INTERNAL_ERROR";
-      await this.audit(identity, "mailbox.reveal", null, "failure", code, requestId);
-      throw new AdminError(code, requestId);
+    const mailbox = await this.dependencies.repository.findRevealableMailbox(publicId);
+    if (mailbox === null) {
+      await this.audit(identity,"mailbox.reveal",null,"failure","INVALID_STATE",requestId);
+      throw new AdminError("INVALID_STATE", requestId);
     }
+    let password: string;
+    try {
+      password = await this.decrypt(mailbox, mailbox.status === "reset_unknown", requestId);
+    } catch {
+      await this.audit(identity,"mailbox.reveal",mailbox.email,"failure","INTERNAL_ERROR",requestId);
+      throw new AdminError("INTERNAL_ERROR", requestId);
+    }
+    try {
+      await this.dependencies.repository.recordPasswordRevealSuccessWithAudit(
+        publicId,this.adminEvent(identity,"mailbox.reveal",mailbox.email,"success",null,requestId),
+      );
+    } catch (error) {
+      const code = error instanceof RepositoryError && error.code === "INVALID_STATE"
+        ? "INVALID_STATE" : "INTERNAL_ERROR";
+      await this.audit(identity,"mailbox.reveal",mailbox.email,"failure",code,requestId);
+      throw new AdminError(code,requestId);
+    }
+    return { password, requestId };
   }
 
   async resetPassword(identity: AdminIdentity, publicId: string): Promise<{ password: string; requestId: string }> {

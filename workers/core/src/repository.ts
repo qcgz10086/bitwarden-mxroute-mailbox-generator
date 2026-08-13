@@ -367,19 +367,21 @@ export class Repository {
       WHERE public_id = ? AND status = 'pending'`).bind(failureCode, updatedAt, publicId), event);
   }
 
-  async authorizePasswordRevealWithAudit(publicId: string, event: AuditEventInput): Promise<MailboxRecord> {
-    const [selected, audit] = await this.db.batch([
-      this.db.prepare(`SELECT ${MAILBOX_COLUMNS} FROM mailboxes
-        WHERE public_id = ? AND status IN ('active', 'reset_unknown', 'delete_failed')`).bind(publicId),
-      this.db.prepare(`INSERT INTO audit_events(id,actor_type,actor_id,actor_email,action,email,result,error_code,request_id,created_at)
-        SELECT ?,?,?,?,?,email,?,?,?,? FROM mailboxes
-        WHERE public_id = ? AND status IN ('active', 'reset_unknown', 'delete_failed')`)
-        .bind(event.id,event.actorType,event.actorId,event.actorEmail ?? null,event.action,event.result,event.errorCode,event.requestId,event.createdAt,publicId),
-    ]);
-    requireSingleChange(audit);
-    const row = selected?.results[0] as MailboxRow | undefined;
-    if (row === undefined) throw new RepositoryError("INVALID_STATE");
-    return mapMailbox(row);
+  async findRevealableMailbox(publicId: string): Promise<MailboxRecord | null> {
+    const row = await this.db.prepare(`SELECT ${MAILBOX_COLUMNS} FROM mailboxes
+      WHERE public_id = ? AND status IN ('active', 'reset_unknown', 'delete_failed')`)
+      .bind(publicId).first<MailboxRow>();
+    return row === null ? null : mapMailbox(row);
+  }
+
+  async recordPasswordRevealSuccessWithAudit(publicId: string, event: AuditEventInput): Promise<void> {
+    const result = await this.db.prepare(`INSERT INTO audit_events(
+        id,actor_type,actor_id,actor_email,action,email,result,error_code,request_id,created_at)
+      SELECT ?,?,?,?,?,email,?,?,?,? FROM mailboxes
+      WHERE public_id = ? AND status IN ('active', 'reset_unknown', 'delete_failed')`)
+      .bind(event.id,event.actorType,event.actorId,event.actorEmail ?? null,event.action,
+        event.result,event.errorCode,event.requestId,event.createdAt,publicId).run();
+    requireSingleChange(result);
   }
 
   async findMailbox(publicId: string): Promise<MailboxRecord | null> {

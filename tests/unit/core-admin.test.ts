@@ -203,9 +203,55 @@ describe("AdministrationService password state machine", () => {
     const audit = await env.DB.prepare("SELECT * FROM audit_events").first<Record<string, unknown>>();
     expect(audit).toMatchObject({ actor_type: "admin", actor_id: ADMIN.subject, actor_email: ADMIN.email, action: "mailbox.reveal", email: EMAIL });
     expect(JSON.stringify(audit)).not.toContain(PASSWORD);
+    const outcomes = await env.DB.prepare("SELECT result FROM audit_events WHERE action = 'mailbox.reveal'").all<{ result: string }>();
+    expect(outcomes.results).toEqual([{ result: "success" }]);
 
     await env.DB.prepare("UPDATE mailboxes SET status = 'deleting' WHERE public_id = 'mbx-1'").run();
     await expectAdminError(service.revealPassword(ADMIN, "mbx-1"), "INVALID_STATE");
+  });
+
+  it.each(["corrupt ciphertext", "missing key"])(
+    "records one failure and no success for reveal with %s",
+    async (failure) => {
+      await seedMailbox();
+      if (failure === "corrupt ciphertext") {
+        await env.DB.prepare("UPDATE mailboxes SET password_ciphertext = ? WHERE public_id = 'mbx-1'")
+          .bind(new Uint8Array([1, 2, 3]).buffer).run();
+      }
+      const service = failure === "missing key"
+        ? new AdministrationService({
+            repository: new Repository(env.DB), mxroute: new FakeMxroute(),
+            tokenPepper: TOKEN_PEPPER, encryptionKeys: {}, encryptionKeyVersion: 1,
+            now: () => new Date(NOW), createId: (kind) => `${kind}-${crypto.randomUUID()}`,
+          })
+        : adminService();
+
+      await expectAdminError(service.revealPassword(ADMIN, "mbx-1"), "INTERNAL_ERROR");
+
+      const outcomes = await env.DB.prepare("SELECT result FROM audit_events WHERE action = 'mailbox.reveal'").all<{ result: string }>();
+      expect(outcomes.results).toEqual([{ result: "failure" }]);
+    },
+  );
+
+  it("returns no plaintext when state changes before final reveal authorization", async () => {
+    await seedMailbox();
+    const repository = new Repository(env.DB);
+    const authorize = vi.spyOn(repository, "recordPasswordRevealSuccessWithAudit")
+      .mockImplementationOnce(async (publicId, event) => {
+        await env.DB.prepare("UPDATE mailboxes SET status = 'deleting' WHERE public_id = ?").bind(publicId).run();
+        authorize.mockRestore();
+        await repository.recordPasswordRevealSuccessWithAudit(publicId, event);
+      });
+    const service = new AdministrationService({
+      repository, mxroute: new FakeMxroute(), tokenPepper: TOKEN_PEPPER,
+      encryptionKeys: { 1: ENCRYPTION_KEY }, encryptionKeyVersion: 1,
+      now: () => new Date(NOW), createId: (kind) => `${kind}-${crypto.randomUUID()}`,
+    });
+
+    await expectAdminError(service.revealPassword(ADMIN, "mbx-1"), "INVALID_STATE");
+
+    const outcomes = await env.DB.prepare("SELECT result FROM audit_events WHERE action = 'mailbox.reveal'").all<{ result: string }>();
+    expect(outcomes.results).toEqual([{ result: "failure" }]);
   });
 
   it("commits reset success and rolls explicit failures back to the current password", async () => {
