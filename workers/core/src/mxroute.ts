@@ -33,6 +33,11 @@ type MxrouteRequest = {
   readonly method: string;
   readonly body?: BodyInit | null;
 };
+type ActiveRequest = {
+  readonly response: Response;
+  readonly signal: AbortSignal;
+  readonly close: () => void;
+};
 
 export interface MxrouteClientDependencies {
   readonly fetch?: MxrouteFetch;
@@ -114,11 +119,15 @@ export class MxrouteClient {
   }
 
   async deleteMailbox(domain: string, user: string): Promise<void> {
-    const response = await this.send(this.mailboxPath(domain, user), { method: "DELETE" });
-    if (response.status === 404 || response.ok) {
-      return;
+    const activeRequest = await this.send(this.mailboxPath(domain, user), { method: "DELETE" });
+    try {
+      if (activeRequest.response.status === 404 || activeRequest.response.ok) {
+        return;
+      }
+      throw serviceErrorForStatus(activeRequest.response.status);
+    } finally {
+      activeRequest.close();
     }
-    throw serviceErrorForStatus(response.status);
   }
 
   private async requestJson<T>(
@@ -126,27 +135,37 @@ export class MxrouteClient {
     request: MxrouteRequest,
     isData: (data: unknown) => data is T,
   ): Promise<T> {
-    const response = await this.send(path, request);
-    if (!response.ok) {
-      throw serviceErrorForStatus(response.status);
-    }
-
-    let payload: unknown;
+    const activeRequest = await this.send(path, request);
     try {
-      payload = await response.json();
-    } catch {
-      throw new ServiceError("MX_INVALID_RESPONSE");
+      if (!activeRequest.response.ok) {
+        throw serviceErrorForStatus(activeRequest.response.status);
+      }
+
+      let payload: unknown;
+      try {
+        payload = await activeRequest.response.json();
+      } catch (error) {
+        if (activeRequest.signal.aborted || isAbortError(error)) {
+          throw new ServiceError("MX_TIMEOUT");
+        }
+        if (isSyntaxError(error)) {
+          throw new ServiceError("MX_INVALID_RESPONSE");
+        }
+        throw new ServiceError("MX_SERVER");
+      }
+      if (!isSuccessPayload(payload) || !isData(payload.data)) {
+        throw new ServiceError("MX_INVALID_RESPONSE");
+      }
+      return payload.data;
+    } finally {
+      activeRequest.close();
     }
-    if (!isSuccessPayload(payload) || !isData(payload.data)) {
-      throw new ServiceError("MX_INVALID_RESPONSE");
-    }
-    return payload.data;
   }
 
   private async send(
     path: string,
     request: MxrouteRequest,
-  ): Promise<Response> {
+  ): Promise<ActiveRequest> {
     const controller = new AbortController();
     const timeout = this.scheduleTimeout(() => controller.abort(), TIMEOUT_MS);
     const headers: Record<string, string> = {
@@ -167,11 +186,17 @@ export class MxrouteClient {
     }
 
     try {
-      return await this.fetch(`${MXROUTE_ORIGIN}${path}`, init);
-    } catch {
-      throw new ServiceError(controller.signal.aborted ? "MX_TIMEOUT" : "MX_SERVER");
-    } finally {
+      const response = await this.fetch(`${MXROUTE_ORIGIN}${path}`, init);
+      return {
+        response,
+        signal: controller.signal,
+        close: () => this.cancelTimeout(timeout),
+      };
+    } catch (error) {
       this.cancelTimeout(timeout);
+      throw new ServiceError(controller.signal.aborted || isAbortError(error)
+        ? "MX_TIMEOUT"
+        : "MX_SERVER");
     }
   }
 
@@ -224,4 +249,12 @@ function mapMailbox(value: UpstreamMailbox): MxrouteMailbox {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function isSyntaxError(error: unknown): boolean {
+  return error instanceof SyntaxError || (error instanceof Error && error.name === "SyntaxError");
 }

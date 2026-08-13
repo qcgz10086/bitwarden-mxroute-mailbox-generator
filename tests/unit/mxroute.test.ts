@@ -192,24 +192,79 @@ describe("MxrouteClient", () => {
     const client = new MxrouteClient(credentials, { fetch });
 
     const result = client.listDomains();
+    let settled = false;
+    void result.then(() => {
+      settled = true;
+    }, () => {
+      settled = true;
+    });
     const assertion = expect(result).rejects.toMatchObject({
       code: "MX_TIMEOUT",
       message: "MX_TIMEOUT",
     });
-    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
 
     await assertion;
   });
 
-  it("rejects malformed or unsuccessful JSON responses without returning upstream data", async () => {
+  it("keeps the timeout active while a successful response body stalls", async () => {
+    vi.useFakeTimers();
+    const fetch: MxrouteFetch = async (_input, init) => new Response(new ReadableStream({
+      start(controller) {
+        init?.signal?.addEventListener("abort", () => {
+          controller.error(new DOMException("body aborted", "AbortError"));
+        }, { once: true });
+      },
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+    const client = new MxrouteClient(credentials, { fetch });
+
+    const result = client.listDomains();
+    let outcome: unknown = "pending";
+    void result.then(
+      () => { outcome = "resolved"; },
+      (error: unknown) => { outcome = error; },
+    );
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(outcome).toMatchObject({ code: "MX_TIMEOUT", message: "MX_TIMEOUT" });
+  });
+
+  it("normalizes body-stream transport failures without misreporting malformed JSON", async () => {
+    const fetch: MxrouteFetch = async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.error(new TypeError("connection reset"));
+      },
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+    const client = new MxrouteClient(credentials, { fetch });
+
+    await expect(client.listDomains()).rejects.toMatchObject({
+      code: "MX_SERVER",
+      message: "MX_SERVER",
+    });
+  });
+
+  it("rejects malformed, unsuccessful, and missing-data JSON responses", async () => {
     const malformed = clientWith(new Response("not-json", { status: 200 }));
-    const unsuccessful = clientWith(success({ not: "used" }));
+    const unsuccessful = clientWith(new Response(JSON.stringify({
+      success: false,
+      data: ["first.test"],
+    }), { status: 200 }));
+    const missingData = clientWith(new Response(JSON.stringify({ success: true }), { status: 200 }));
 
     await expect(malformed.listDomains()).rejects.toMatchObject({
       code: "MX_INVALID_RESPONSE",
       message: "MX_INVALID_RESPONSE",
     });
-    await expect(unsuccessful.getMailbox("example.test", "alpha")).rejects.toMatchObject({
+    await expect(unsuccessful.listDomains()).rejects.toMatchObject({
+      code: "MX_INVALID_RESPONSE",
+      message: "MX_INVALID_RESPONSE",
+    });
+    await expect(missingData.listDomains()).rejects.toMatchObject({
       code: "MX_INVALID_RESPONSE",
       message: "MX_INVALID_RESPONSE",
     });
