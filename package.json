@@ -1,0 +1,28 @@
+{
+  "name": "bitwarden-mxroute-mailbox-generator",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "npm run build:admin && npm run typecheck",
+    "build:admin": "node scripts/build-admin.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts",
+    "test:integration": "vitest run --config vitest.integration.config.ts --max-workers=1 --no-isolate",
+    "types": "wrangler types -c workers/core/wrangler.jsonc -c workers/generator/wrangler.jsonc -c workers/admin/wrangler.jsonc",
+    "check": "npm run typecheck && npm test && npm run test:integration"
+  },
+  "dependencies": {
+    "jose": "^6.2.8"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.21.2",
+    "@cloudflare/workers-types": "^5.20260813.1",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.122.0"
+  }
+}

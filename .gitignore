@@ -4,5 +4,7 @@ work/
 node_modules/
 .wrangler/
 .dev.vars*
+.env*
 dist/
 coverage/
+worker-configuration.d.ts

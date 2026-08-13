@@ -1,0 +1,18 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "bitwarden-mxroute-admin",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-13",
+  "workers_dev": false,
+  "services": [
+    {
+      "binding": "CORE",
+      "service": "bitwarden-mxroute-core"
+    }
+  ],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  }
+}

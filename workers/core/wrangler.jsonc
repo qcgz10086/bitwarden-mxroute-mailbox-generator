@@ -1,0 +1,26 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "bitwarden-mxroute-core",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-13",
+  "workers_dev": false,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "bitwarden-mxroute",
+      "database_id": "00000000-0000-0000-0000-000000000001"
+    }
+  ],
+  "secrets": {
+    "required": [
+      "MXROUTE_SERVER",
+      "MXROUTE_USERNAME",
+      "MXROUTE_API_KEY",
+      "TOKEN_PEPPER",
+      "ENC_KEY_V1"
+    ]
+  },
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  }
+}
