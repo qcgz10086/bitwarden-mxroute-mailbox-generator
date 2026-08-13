@@ -23,6 +23,9 @@ scheduled recovery. Do not remove the `services[].entrypoint` selectors.
 API-token issuance is two phase. The browser reuses a client operation ID after a lost response;
 Core retains the pending raw token only as AES-GCM ciphertext for ten minutes. Copying or explicitly
 accepting it acknowledges the token, atomically erases the ciphertext, and activates authentication.
+Acknowledgement is idempotent for the same Access subject, token ID, and operation ID, so a lost ACK
+response can be retried without recovering or retaining the raw token. The management table labels
+each credential as Pending (with expiry), Active, or Revoked.
 Unacknowledged tokens cannot authenticate and cron revokes expired pending records. A known token ID
 is revoked with a same-origin keepalive request during page unload.
 

@@ -545,10 +545,17 @@ export class AdministrationService {
     }
   }
 
-  acknowledgeApiToken(identity: AdminIdentity, id: string, operationId: string): Promise<{ requestId: string }> {
-    return this.adminMutation(identity, "token.create.acknowledge", null, async (event) => {
-      await this.dependencies.repository.acknowledgeTokenWithAudit(id, operationId, identity.subject, this.now().toISOString(), event);
-    });
+  async acknowledgeApiToken(identity: AdminIdentity, id: string, operationId: string): Promise<{ requestId: string }> {
+    const requestId = this.createId("request");
+    try {
+      await this.dependencies.repository.acknowledgeTokenWithAudit(id, operationId, identity.subject, this.now().toISOString(),
+        this.adminEvent(identity,"token.create.acknowledge",null,"success",null,requestId));
+      return { requestId };
+    } catch (error) {
+      const code = repositoryAdminCode(error);
+      await this.audit(identity,"token.create.acknowledge",null,"failure",code,requestId);
+      throw new AdminError(code,requestId);
+    }
   }
 
   revokeApiToken(identity: AdminIdentity, id: string): Promise<{ requestId: string }> {

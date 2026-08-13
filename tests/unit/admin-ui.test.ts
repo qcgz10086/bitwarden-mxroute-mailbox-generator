@@ -9,6 +9,7 @@ import {
   activeDomainNames,
   bindSensitiveLifecycleEvents,
   formatMailboxRow,
+  formatTokenStatus,
   runAction,
   performExactDelete,
   runDisabled,
@@ -29,6 +30,11 @@ const mailbox: MailboxSummary = {
 };
 
 describe("admin UI safe helpers", () => {
+  it("renders pending, active, and revoked token states without ambiguity", () => {
+    expect(formatTokenStatus({ status: "pending", pendingExpiresAt: "2026-08-13T10:20:00.000Z" })).toBe("Pending until 2026-08-13T10:20:00.000Z");
+    expect(formatTokenStatus({ status: "active", pendingExpiresAt: null })).toBe("Active");
+    expect(formatTokenStatus({ status: "revoked", pendingExpiresAt: null })).toBe("Revoked");
+  });
   it("assigns hostile values only through textContent", () => {
     let assigned = "";
     const node = {
@@ -231,6 +237,18 @@ describe("sensitive event workflows", () => {
     await expect(workflow.create("phone")).resolves.toBe("failed");
     await expect(workflow.create("phone")).resolves.toBe("displayed");
     expect(create.mock.calls[1]?.[1]).toBe(create.mock.calls[0]?.[1]);
+  });
+
+  it("retries acknowledgement after a committed response is lost and never revokes on pagehide", async () => {
+    let attempts = 0;
+    const acknowledge = vi.fn(async () => { attempts += 1; if (attempts === 1) throw new TypeError("ack response lost"); });
+    const revoke = vi.fn(async () => undefined);
+    const workflow = new TokenCreationWorkflow({ create: vi.fn(async () => ({ id: "t-ack-lost", rawToken: "raw-ack-lost" })), acknowledge, revoke, display: vi.fn(), clear: vi.fn(), report: vi.fn() });
+    await workflow.create("phone");
+    await expect(workflow.copyTo(async () => undefined)).resolves.toBe(true);
+    expect(acknowledge).toHaveBeenCalledTimes(2);
+    workflow.pagehide(); await workflow.compensation();
+    expect(revoke).not.toHaveBeenCalled();
   });
 
   it("keeps compensation failures secret-free and reports only while context remains", async () => {

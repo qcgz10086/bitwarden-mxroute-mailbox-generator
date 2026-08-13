@@ -116,6 +116,8 @@ export interface ApiTokenRecord {
   readonly createdAt: string;
   readonly lastUsedAt: string | null;
   readonly revokedAt: string | null;
+  readonly status: "pending" | "active" | "revoked";
+  readonly pendingExpiresAt: string | null;
 }
 
 export interface PendingApiTokenRecord extends ApiTokenRecord {
@@ -202,6 +204,8 @@ type TokenRow = {
   created_at: string;
   last_used_at: string | null;
   revoked_at: string | null;
+  acknowledged_at?: string | null;
+  pending_expires_at?: string | null;
 };
 
 type PageCursor = {
@@ -747,6 +751,7 @@ export class Repository {
     return {
       id: String(row.id), name: String(row.name), createdAt: String(row.created_at),
       lastUsedAt: row.last_used_at == null ? null : String(row.last_used_at), revokedAt: null,
+      status: "pending",
       operationId: String(row.operation_id), pendingExpiresAt: String(row.pending_expires_at),
       pendingToken: { ciphertext: fromBlob(row.pending_token_ciphertext), nonce: fromBlob(row.pending_token_nonce), keyVersion: Number(row.pending_token_key_version) },
     };
@@ -756,11 +761,24 @@ export class Repository {
     return await this.db.prepare("SELECT 1 found FROM api_tokens WHERE operation_id=?").bind(operationId).first("found") === 1;
   }
 
-  async acknowledgeTokenWithAudit(id: string, operationId: string, actorId: string, acknowledgedAt: string, event: AuditEventInput): Promise<void> {
-    await this.mutateWithAudit(this.db.prepare(`UPDATE api_tokens SET acknowledged_at=?,
+  async acknowledgeTokenWithAudit(id: string, operationId: string, actorId: string, acknowledgedAt: string, event: AuditEventInput): Promise<"acknowledged" | "already_acknowledged"> {
+    const [changed, audit] = await this.db.batch([
+      this.db.prepare(`UPDATE api_tokens SET acknowledged_at=?,acknowledged_actor_id=?,
       pending_token_ciphertext=NULL,pending_token_nonce=NULL,pending_token_key_version=NULL,pending_expires_at=NULL,pending_actor_id=NULL
       WHERE id=? AND operation_id=? AND pending_actor_id=? AND revoked_at IS NULL AND acknowledged_at IS NULL`)
-      .bind(acknowledgedAt,id,operationId,actorId), event);
+      .bind(acknowledgedAt,actorId,id,operationId,actorId),
+      auditStatement(this.db,event,true),
+    ]);
+    if (Number(changed?.meta.changes ?? 0) === 1) {
+      requireSingleChange(audit);
+      return "acknowledged";
+    }
+    if (Number(audit?.meta.changes ?? 0) !== 0) throw new RepositoryError("INVALID_STATE");
+    const existing = await this.db.prepare(`SELECT 1 found FROM api_tokens WHERE id=? AND operation_id=?
+      AND acknowledged_actor_id=? AND revoked_at IS NULL AND acknowledged_at IS NOT NULL`)
+      .bind(id,operationId,actorId).first("found");
+    if (existing === 1) return "already_acknowledged";
+    throw new RepositoryError("INVALID_STATE");
   }
 
   async listExpiredPendingTokenIds(expiredBefore: string, limit = 25): Promise<readonly string[]> {
@@ -783,10 +801,12 @@ export class Repository {
   }
 
   async listTokens(): Promise<readonly ApiTokenRecord[]> {
-    const result = await this.db.prepare(`SELECT id, name, created_at, last_used_at, revoked_at
+    const result = await this.db.prepare(`SELECT id, name, created_at, last_used_at, revoked_at,acknowledged_at,pending_expires_at
       FROM api_tokens ORDER BY created_at DESC, id DESC`).all<TokenRow>();
     return result.results.map((row) => ({ id: row.id, name: row.name, createdAt: row.created_at,
-      lastUsedAt: row.last_used_at, revokedAt: row.revoked_at }));
+      lastUsedAt: row.last_used_at, revokedAt: row.revoked_at,
+      status: row.revoked_at !== null ? "revoked" : row.acknowledged_at === null ? "pending" : "active",
+      pendingExpiresAt: row.pending_expires_at ?? null }));
   }
 
   async revokeToken(id: string, revokedAt: string): Promise<void> {
@@ -824,6 +844,8 @@ export class Repository {
       createdAt: row.created_at,
       lastUsedAt: row.last_used_at,
       revokedAt: row.revoked_at,
+      status: "active",
+      pendingExpiresAt: null,
     };
   }
 

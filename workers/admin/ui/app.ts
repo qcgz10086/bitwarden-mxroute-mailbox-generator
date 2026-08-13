@@ -192,7 +192,12 @@ export class TokenCreationWorkflow {
   async compensation(): Promise<void> { await Promise.all(this.revocations.values()); }
   private async acknowledge(): Promise<void> {
     if (this.tokenId === null || this.operationId === null || this.saved) return;
-    await this.dependencies.acknowledge(this.tokenId, this.operationId); this.saved = true;
+    let failure: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try { await this.dependencies.acknowledge(this.tokenId, this.operationId); this.saved = true; return; }
+      catch (error) { failure = error; }
+    }
+    throw failure;
   }
   private clearDisplay(): void { this.generation += 1; this.rawToken = null; this.tokenId = null; this.operationId = null; this.operationName = null; this.saved = false; try { this.dependencies.clear(); } catch {} }
   private revokeOnce(id: string, keepalive = false, reportFailure = true): Promise<boolean> {
@@ -242,7 +247,10 @@ export class AdminApi {
 
 interface Domain { domain: string; active: boolean; syncedAt: string; }
 interface Settings extends SettingsInput { defaultDomain: string | null; prefixLength: number; generationEnabled: boolean; }
-interface ApiToken { id: string; name: string; createdAt: string; lastUsedAt: string | null; revokedAt: string | null; }
+interface ApiToken { id: string; name: string; createdAt: string; lastUsedAt: string | null; revokedAt: string | null; status: "pending" | "active" | "revoked"; pendingExpiresAt: string | null; }
+export function formatTokenStatus(token: Pick<ApiToken,"status" | "pendingExpiresAt">): string {
+  return token.status === "pending" ? `Pending until ${token.pendingExpiresAt ?? "expiry unavailable"}` : token.status === "active" ? "Active" : "Revoked";
+}
 interface AuditRecord { id: string; actorType: string; actorId: string; actorEmail: string | null; action: string; email: string | null; result: string; errorCode: string | null; requestId: string; createdAt: string; }
 
 export class RecoveryPager {
@@ -355,7 +363,7 @@ async function loadSettings(): Promise<void> {
 
 async function loadTokens(): Promise<void> {
   const tokens = await api.get<readonly ApiToken[]>("/api/tokens"); const body = byId<HTMLTableSectionElement>("token-rows"); body.replaceChildren();
-  for (const token of tokens) { const row = body.insertRow(); cell(row, token.name); cell(row, token.createdAt); cell(row, token.lastUsedAt ?? "Never"); cell(row, token.revokedAt ? "Revoked" : "Active"); const actions = row.insertCell(); if (!token.revokedAt) actions.append(button("Revoke", async () => { if (!confirm(`Revoke token ${token.name}?`)) return; await api.mutate(`/api/tokens/${encodeURIComponent(token.id)}`, "DELETE"); await loadTokens(); }, true)); }
+  for (const token of tokens) { const row = body.insertRow(); cell(row, token.name); cell(row, token.createdAt); cell(row, token.lastUsedAt ?? "Never"); cell(row, formatTokenStatus(token)); const actions = row.insertCell(); if (token.status !== "revoked") actions.append(button("Revoke", async () => { if (!confirm(`Revoke token ${token.name}?`)) return; await api.mutate(`/api/tokens/${encodeURIComponent(token.id)}`, "DELETE"); await loadTokens(); }, true)); }
 }
 
 async function loadAudit(cursor?: string): Promise<void> {

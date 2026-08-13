@@ -8,5 +8,5 @@ it("applies all Core migrations to a fresh database", async () => {
   const columns = await env.DB.prepare("PRAGMA table_info(mailboxes)").all<{ name: string }>();
   expect(columns.results.map((column) => column.name)).toContain("recovery_attempt_count");
   const applied = await env.DB.prepare("SELECT name FROM d1_migrations ORDER BY id").all<{ name: string }>();
-  expect(applied.results.map((row) => row.name)).toEqual(["0001.sql", "0002.sql", "0003.sql"]);
+  expect(applied.results.map((row) => row.name)).toEqual(["0001.sql", "0002.sql", "0003.sql", "0004.sql"]);
 });

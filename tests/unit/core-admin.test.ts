@@ -126,7 +126,8 @@ describe("AdministrationService configuration and tokens", () => {
     expect(await service.listDomains(ADMIN)).toEqual([{ domain: DOMAIN, active: true, syncedAt: NOW }]);
     expect(await service.getSettings(ADMIN)).toMatchObject({ mailboxQuotaMb: 100, prefixLength: 12 });
     const tokens = await service.listApiTokens(ADMIN);
-    expect(tokens).toEqual([{ id: created.id, name: "Phone", createdAt: NOW, lastUsedAt: null, revokedAt: null }]);
+    expect(tokens).toEqual([{ id: created.id, name: "Phone", createdAt: NOW, lastUsedAt: null, revokedAt: null,
+      status: "pending", pendingExpiresAt: "2026-08-13T10:20:00.000Z" }]);
     expect(JSON.stringify(tokens)).not.toContain(created.rawToken);
   });
 
@@ -175,6 +176,9 @@ describe("AdministrationService configuration and tokens", () => {
     const retry = await service.createApiToken(ADMIN, "Primary", "operation-primary-0001");
     expect(retry).toMatchObject({ id: first.id, rawToken: first.rawToken });
     await service.acknowledgeApiToken(ADMIN, first.id, "operation-primary-0001");
+    await expect(service.acknowledgeApiToken(ADMIN, first.id, "operation-primary-0001")).resolves.toHaveProperty("requestId");
+    expect(await env.DB.prepare("SELECT COUNT(*) count FROM audit_events WHERE action='token.create.acknowledge'").first("count")).toBe(1);
+    expect((await service.listApiTokens(ADMIN)).find((token) => token.id === first.id)).toMatchObject({ status: "active", pendingExpiresAt: null });
     await expectAdminError(service.createApiToken(ADMIN, "Primary", "operation-primary-0001"), "INVALID_STATE");
     const second = await service.createApiToken(ADMIN, "Rotation", "operation-rotation-0001");
     await expectAdminError(service.createApiToken(ADMIN, "Third", "operation-third-0001"), "TOKEN_LIMIT");
@@ -192,7 +196,15 @@ describe("AdministrationService configuration and tokens", () => {
     })).rejects.toMatchObject({ code: "TOKEN_LIMIT" });
 
     await service.revokeApiToken(ADMIN, first.id);
+    expect((await service.listApiTokens(ADMIN)).find((token) => token.id === first.id)).toMatchObject({ status: "revoked", pendingExpiresAt: null });
     expect(await new Repository(env.DB).verifyTokenDigest(await tokenHmac(first.rawToken, TOKEN_PEPPER), NOW)).toBeNull();
+  });
+
+  it("rejects idempotent acknowledgement from a different Access subject", async () => {
+    const service = adminService();
+    const created = await service.createApiToken(ADMIN, "Phone", "operation-owner-0001");
+    await service.acknowledgeApiToken(ADMIN, created.id, "operation-owner-0001");
+    await expectAdminError(service.acknowledgeApiToken({ subject: "other-subject", email: "other@example.test" }, created.id, "operation-owner-0001"), "INVALID_STATE");
   });
 
   it("revokes and clears expired unacknowledged token issuance", async () => {

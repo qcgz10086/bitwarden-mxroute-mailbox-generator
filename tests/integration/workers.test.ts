@@ -248,8 +248,15 @@ describe.sequential("three Worker integration", () => {
     const response = await adminMutation("/api/tokens", "POST", { name, operationId }, session.csrfToken, session.cookie);
     expect(response.status).toBe(200);
     const created = await response.json() as { id: string; rawToken: string };
+    const auditBefore = Number(await db.prepare("SELECT COUNT(*) count FROM audit_events WHERE action='token.create.acknowledge'").first("count"));
     const acknowledged = await adminMutation(`/api/tokens/${created.id}/acknowledge`, "POST", { operationId }, session.csrfToken, session.cookie);
     expect(acknowledged.status).toBe(200);
+    const acknowledgedRetry = await adminMutation(`/api/tokens/${created.id}/acknowledge`, "POST", { operationId }, session.csrfToken, session.cookie);
+    expect(acknowledgedRetry.status).toBe(200);
+    expect(Number(await db.prepare("SELECT COUNT(*) count FROM audit_events WHERE action='token.create.acknowledge'").first("count"))).toBe(auditBefore + 1);
+    const listed = await adminRequest("/api/tokens");
+    expect((await listed.json() as Array<{ id: string; status: string; pendingExpiresAt: string | null }>).find((token) => token.id === created.id))
+      .toMatchObject({ status: "active", pendingExpiresAt: null });
     return created;
   }
 
