@@ -26,6 +26,15 @@ describe("Access JWT validation", () => {
     await expect(validateAccess(authRequest(), config(), createLocalJWKSet(fixture.jwks)))
       .resolves.toEqual({ subject: "access-user", email: "admin@example.com" });
   });
+  it("creates one remote JWKS resolver per normalized team domain", async () => {
+    const remoteToken = await fixture.issue({}, { issuer: "https://cache.cloudflareaccess.com" });
+    const request = new Request(ORIGIN, { headers: { "Cf-Access-Jwt-Assertion": remoteToken } });
+    const factory = vi.fn(() => createLocalJWKSet(fixture.jwks));
+    const cachedConfig = { teamDomain: "https://cache.cloudflareaccess.com/", audience: "admin-aud", adminEmails: "admin@example.com" };
+    await validateAccess(request, cachedConfig, undefined, factory);
+    await validateAccess(request, cachedConfig, undefined, factory);
+    expect(factory).toHaveBeenCalledTimes(1);
+  });
   it("rejects missing, invalid, wrongly-scoped and incomplete assertions", async () => {
     const verify = (request: Request) => validateAccess(request, config(), createLocalJWKSet(fixture.jwks));
     await expect(verify(new Request(ORIGIN))).rejects.toMatchObject({ status: 401 });
@@ -85,11 +94,14 @@ describe("Admin worker", () => {
     const s = setup();
     expect((await s.fetch(new Request(`${ORIGIN}/`))).status).toBe(401);
     expect(s.ASSETS.fetch).not.toHaveBeenCalled();
-    const response = await s.fetch(authRequest("/"));
-    expect(await response.text()).toBe("asset");
-    expect(response.headers.get("Content-Security-Policy")).toContain("frame-ancestors 'none'");
-    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
-    expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
+    for (const path of ["/", "/app.js", "/app.css"]) {
+      const response = await s.fetch(authRequest(path));
+      expect(await response.text()).toBe("asset");
+      expect(response.headers.get("Content-Security-Policy")).toContain("frame-ancestors 'none'");
+      expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+      expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+    }
   });
   it("issues a host-only 32-byte CSRF cookie", async () => {
     const s = setup(); const response = await s.fetch(authRequest()); const data = await response.json() as { csrfToken: string };
@@ -108,12 +120,22 @@ describe("Admin worker", () => {
   });
   it("maps all read routes with typed, capped query input and identity", async () => {
     const s = setup();
-    expect((await s.fetch(authRequest("/api/mailboxes?limit=100&status=active&domain=example.com&sort=email&direction=asc&search=a&cursor=c"))).status).toBe(200);
-    expect(s.CORE.pageMailboxes).toHaveBeenCalledWith({ subject: "access-user", email: "admin@example.com" }, { limit: 100, status: "active", domain: "example.com", sort: "email", direction: "asc", search: "a", cursor: "c" });
-    for (const [path, spy] of [["/api/domains", s.CORE.listDomains], ["/api/settings", s.CORE.getSettings], ["/api/tokens", s.CORE.listApiTokens], ["/api/audit?limit=2&cursor=c", s.CORE.pageAudit]] as const) {
+    const mailboxCursor = btoa(JSON.stringify({ sort:"email", direction:"asc", value:"a@example.com", publicId:"m1" }));
+    const auditCursor = btoa(JSON.stringify({ createdAt:"2026-08-13T00:00:00.000Z", id:"a1" }));
+    expect((await s.fetch(authRequest(`/api/mailboxes?limit=100&status=active&domain=example.com&sort=email&direction=asc&search=a&cursor=${encodeURIComponent(mailboxCursor)}`))).status).toBe(200);
+    expect(s.CORE.pageMailboxes).toHaveBeenCalledWith({ subject: "access-user", email: "admin@example.com" }, { limit: 100, status: "active", domain: "example.com", sort:"email", direction:"asc", search:"a", cursor:mailboxCursor });
+    for (const [path, spy] of [["/api/domains", s.CORE.listDomains], ["/api/settings", s.CORE.getSettings], ["/api/tokens", s.CORE.listApiTokens], [`/api/audit?limit=2&cursor=${encodeURIComponent(auditCursor)}`, s.CORE.pageAudit]] as const) {
       expect((await s.fetch(authRequest(path))).status).toBe(200); expect(spy).toHaveBeenCalled();
     }
     for (const path of ["/api/mailboxes?limit=101", "/api/mailboxes?limit=NaN", "/api/mailboxes?status=nope", "/api/mailboxes?domain=bad%20domain", "/api/mailboxes?sort=nope", "/api/mailboxes?direction=nope", "/api/audit?limit=0", "/api/settings?unexpected=1"]) expect((await s.fetch(authRequest(path))).status).toBe(400);
+  });
+  it("rejects structurally malformed mailbox and audit cursors before Core RPC", async () => {
+    const s = setup();
+    for (const path of ["/api/mailboxes?cursor=not-base64", `/api/mailboxes?cursor=${btoa("{}")}`, "/api/audit?cursor=not-base64", `/api/audit?cursor=${btoa("{}")}`]) {
+      expect((await s.fetch(authRequest(path))).status).toBe(400);
+    }
+    expect(s.CORE.pageMailboxes).not.toHaveBeenCalled();
+    expect(s.CORE.pageAudit).not.toHaveBeenCalled();
   });
   it("maps every mutation and never caches password responses", async () => {
     const s = setup(); const id: AdminIdentity = { subject: "access-user", email: "admin@example.com" };
@@ -143,6 +165,27 @@ describe("Admin worker", () => {
   it("returns stable non-leaking errors", async () => {
     const s=setup(); s.CORE.pageMailboxes.mockRejectedValueOnce(new Error("D1 password upstream stack"));
     const response=await s.fetch(authRequest("/api/mailboxes")); expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error:"INTERNAL_ERROR" });
+  });
+  it.each([
+    ["CONFIRMATION_MISMATCH", "/api/mailboxes/m1", "DELETE", { confirmationEmail:"x@example.com" }, 400, false],
+    ["INVALID_STATE", "/api/mailboxes/m1/reveal", "POST", {}, 409, false],
+    ["TOKEN_LIMIT", "/api/tokens", "POST", { name:"phone" }, 409, false],
+    ["MX_TIMEOUT", "/api/mailboxes/m1/reset", "POST", {}, 503, true],
+    ["NOT_FOUND", "/api/mailboxes/m1/reveal", "POST", {}, 404, false],
+  ])("maps sanitized Core error %s", async (code,path,method,body,status,retryable) => {
+    const s=setup();
+    const methodName = code === "CONFIRMATION_MISMATCH" ? "deleteMailbox" : code === "TOKEN_LIMIT" ? "createApiToken" : code === "MX_TIMEOUT" ? "resetPassword" : "revealPassword";
+    s.CORE[methodName].mockRejectedValueOnce(Object.assign(new Error("secret upstream D1 stack"), { name:"AdminError", code, requestId:"request-safe_123", retryable }));
+    const response=await mutate(s,path,method,body);
+    expect(response.status).toBe(status);
+    expect(await response.json()).toEqual({ error:code, requestId:"request-safe_123", retryable });
+  });
+  it("collapses unknown or malformed Core errors without leaking fields", async () => {
+    const s=setup();
+    s.CORE.pageMailboxes.mockRejectedValueOnce(Object.assign(new Error("password=secret"), { code:"EVIL", requestId:"bad request id", retryable:true }));
+    const response=await s.fetch(authRequest("/api/mailboxes"));
+    expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ error:"INTERNAL_ERROR" });
   });
 });

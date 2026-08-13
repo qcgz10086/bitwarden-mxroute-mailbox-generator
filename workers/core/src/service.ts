@@ -698,6 +698,7 @@ function repositoryAdminCode(error: unknown): AdminErrorCode {
     if (error.code === "INACTIVE_DOMAIN" || error.code === "INVALID_SETTINGS" || error.code === "INVALID_STATE" || error.code === "INVALID_INPUT") {
       return error.code;
     }
+    if (error.code === "INVALID_CURSOR") return "INVALID_INPUT";
   }
   return "INTERNAL_ERROR";
 }

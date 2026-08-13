@@ -16,6 +16,15 @@ const SECURITY_HEADERS: Readonly<Record<string,string>> = {
   "X-Content-Type-Options": "nosniff",
   "Referrer-Policy": "no-referrer",
 };
+const CORE_ERROR_STATUS: Readonly<Record<string, number>> = {
+  INVALID_INPUT: 400, INVALID_SETTINGS: 400, INACTIVE_DOMAIN: 400,
+  CONFIRMATION_MISMATCH: 400, MX_CLIENT: 400,
+  NOT_FOUND: 404, MX_NOT_FOUND: 404,
+  INVALID_STATE: 409, TOKEN_LIMIT: 409, MX_CONFLICT: 409,
+  MX_UNAUTHORIZED: 502, MX_INVALID_RESPONSE: 502,
+  MX_RATE_LIMITED: 503, MX_SERVER: 503, MX_TIMEOUT: 503,
+  INTERNAL_ERROR: 500,
+};
 
 export interface AdminCore {
   pageMailboxes(identity: AdminIdentity, options: PageMailboxesOptions): Promise<MailboxPage>;
@@ -58,17 +67,18 @@ export function createAdminHandler(dependencies: { jwks?: JWTVerifyGetKey } = {}
         }, dependencies.jwks);
         const url = new URL(request.url);
         if (url.pathname !== "/api" && !url.pathname.startsWith("/api/")) {
-          return secure(await env.ASSETS.fetch(request), false);
+          return secure(await env.ASSETS.fetch(request));
         }
         const method = request.method.toUpperCase();
         if (["POST", "PUT", "DELETE"].includes(method) && !validateCsrf(request, env.ADMIN_ORIGIN)) {
           throw new HttpError(403, "FORBIDDEN");
         }
-        return secure(await route(request, url, method, identity, env.CORE), true);
+        return secure(await route(request, url, method, identity, env.CORE));
       } catch (error) {
-        if (error instanceof AccessError) return secure(json({ error: "UNAUTHORIZED" }, 401), true);
-        if (error instanceof HttpError) return secure(json({ error: error.code }, error.status), true);
-        return secure(json({ error: "INTERNAL_ERROR" }, 500), true);
+        if (error instanceof AccessError) return secure(json({ error: "UNAUTHORIZED" }, 401));
+        if (error instanceof HttpError) return secure(json({ error: error.code }, error.status));
+        const normalized = normalizeCoreError(error);
+        return secure(json(normalized.body, normalized.status));
       }
     },
   };
@@ -186,7 +196,11 @@ function pageQuery(url: URL, allowed = new Set(["limit", "cursor"])): PageAuditO
     out.limit = number;
   }
   const cursor = url.searchParams.get("cursor");
-  if (cursor !== null) out.cursor = bounded(cursor, 2048);
+  if (cursor !== null) {
+    const validatedCursor = bounded(cursor, 2048);
+    out.cursor = validatedCursor;
+    validateCursor(validatedCursor, allowed.has("sort") ? "mailbox" : "audit", out);
+  }
   return out as PageAuditOptions;
 }
 
@@ -274,11 +288,51 @@ function json(value: unknown, status = 200, headers: HeadersInit = {}): Response
   });
 }
 
-function secure(response: Response, api: boolean): Response {
+function secure(response: Response): Response {
   const headers = new Headers(response.headers);
   for (const [key, value] of Object.entries(SECURITY_HEADERS)) headers.set(key, value);
-  if (api) headers.set("Cache-Control", "no-store");
+  headers.set("Cache-Control", "no-store");
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function validateCursor(
+  cursor: string,
+  kind: "mailbox" | "audit",
+  options: Record<string, unknown>,
+): void {
+  let value: unknown;
+  try { value = JSON.parse(atob(cursor)); }
+  catch { throw new HttpError(400, "INVALID_INPUT"); }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new HttpError(400, "INVALID_INPUT");
+  const record = value as Record<string, unknown>;
+  if (kind === "audit") {
+    if (typeof record.createdAt !== "string" || typeof record.id !== "string"
+      || record.createdAt.length === 0 || record.id.length === 0) throw new HttpError(400, "INVALID_INPUT");
+    return;
+  }
+  if (!["createdAt", "email", "status"].includes(String(record.sort))
+    || !["asc", "desc"].includes(String(record.direction))
+    || typeof record.value !== "string" || typeof record.publicId !== "string"
+    || record.value.length === 0 || record.publicId.length === 0
+    || (options.sort !== undefined && record.sort !== options.sort)
+    || (options.direction !== undefined && record.direction !== options.direction)) {
+    throw new HttpError(400, "INVALID_INPUT");
+  }
+}
+
+function normalizeCoreError(error: unknown): {
+  readonly status: number;
+  readonly body: { readonly error: string; readonly requestId?: string; readonly retryable?: boolean };
+} {
+  if (error === null || typeof error !== "object") return { status: 500, body: { error: "INTERNAL_ERROR" } };
+  const candidate = error as Record<string, unknown>;
+  const code = typeof candidate.code === "string" ? candidate.code : "";
+  const status = CORE_ERROR_STATUS[code];
+  const requestId = typeof candidate.requestId === "string" ? candidate.requestId : "";
+  if (status === undefined || !/^[A-Za-z0-9_.:-]{1,200}$/.test(requestId) || typeof candidate.retryable !== "boolean") {
+    return { status: 500, body: { error: "INTERNAL_ERROR" } };
+  }
+  return { status, body: { error: code, requestId, retryable: candidate.retryable } };
 }
 
 export default createAdminHandler();

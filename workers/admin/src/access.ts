@@ -6,12 +6,26 @@ export class AccessError extends Error {
 }
 
 export interface AccessConfig { readonly teamDomain: string; readonly audience: string; readonly adminEmails: string; }
+type JwksFactory = (url: URL) => JWTVerifyGetKey;
+const remoteJwks = new Map<string, JWTVerifyGetKey>();
 
-export async function validateAccess(request: Request, config: AccessConfig, suppliedJwks?: JWTVerifyGetKey): Promise<AdminIdentity> {
+export async function validateAccess(
+  request: Request,
+  config: AccessConfig,
+  suppliedJwks?: JWTVerifyGetKey,
+  jwksFactory: JwksFactory = createRemoteJWKSet,
+): Promise<AdminIdentity> {
   const assertion = request.headers.get("Cf-Access-Jwt-Assertion");
   if (!assertion) throw new AccessError();
   const issuer = config.teamDomain.replace(/\/$/, "");
-  const jwks = suppliedJwks ?? createRemoteJWKSet(new URL(`${issuer}/cdn-cgi/access/certs`));
+  let jwks = suppliedJwks;
+  if (jwks === undefined) {
+    jwks = remoteJwks.get(issuer);
+    if (jwks === undefined) {
+      jwks = jwksFactory(new URL(`${issuer}/cdn-cgi/access/certs`));
+      remoteJwks.set(issuer, jwks);
+    }
+  }
   try {
     const { payload } = await jwtVerify(assertion, jwks, { issuer, audience: config.audience });
     if (typeof payload.sub !== "string" || payload.sub.length === 0 || typeof payload.email !== "string") throw new AccessError();
