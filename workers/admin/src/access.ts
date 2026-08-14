@@ -15,7 +15,13 @@ export async function validateAccess(
   suppliedJwks?: JWTVerifyGetKey,
   jwksFactory: JwksFactory = createRemoteJWKSet,
 ): Promise<AdminIdentity> {
-  const assertion = request.headers.get("Cf-Access-Jwt-Assertion");
+  let assertion = request.headers.get("Cf-Access-Jwt-Assertion");
+  if (!assertion) {
+    const cookie = request.headers.get("Cookie");
+    const prefix = "CF_Authorization=";
+    const part = cookie?.split(";").map((value) => value.trim()).find((value) => value.startsWith(prefix));
+    assertion = part ? part.slice(prefix.length) : null;
+  }
   if (!assertion) throw new AccessError();
   const issuer = config.teamDomain.replace(/\/$/, "");
   let jwks = suppliedJwks;

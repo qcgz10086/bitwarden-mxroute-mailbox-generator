@@ -167,7 +167,11 @@ describe.sequential("three Worker integration", () => {
     const attacker = await accessFixture();
     const forged = await attacker.issue();
     expect(forged.split(".")).toHaveLength(3);
-    const response = await admin.fetch("/api/mailboxes", { headers: { "Cf-Access-Jwt-Assertion": forged } });
+    const response = await admin.fetch("/api/auth/reset", {
+      method: "POST",
+      headers: { "Cf-Access-Jwt-Assertion": forged, Origin: ORIGIN, "Content-Type": "application/json" },
+      body: JSON.stringify({ newPassword: "x12345678" }),
+    });
     expect(response.status).toBe(401);
     expect(await response.json()).toEqual({ error: "UNAUTHORIZED" });
   });

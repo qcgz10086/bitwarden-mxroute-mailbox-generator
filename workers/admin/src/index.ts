@@ -6,6 +6,7 @@ import type {
 import type { AdminSettingsPatch } from "../../core/src/service";
 import { AccessError, validateAccess } from "./access";
 import { createCsrfToken, csrfCookie, validateCsrf } from "./csrf";
+import { LOGIN_PAGE, RESET_PAGE } from "./pages";
 
 const BODY_LIMIT = 65_536;
 const STATUSES: readonly MailboxStatus[] = [
@@ -69,17 +70,41 @@ export function createAdminHandler(dependencies: { jwks?: JWTVerifyGetKey } = {}
   return {
     async fetch(request: Request, env: AdminEnv): Promise<Response> {
       try {
-        const identity = await validateAccess(request, {
-          teamDomain: env.ACCESS_TEAM_DOMAIN,
-          audience: env.ACCESS_AUD,
-          adminEmails: env.ADMIN_EMAILS,
-        }, dependencies.jwks);
         const url = new URL(request.url);
         const isApi = url.pathname === "/api" || url.pathname.startsWith("/api/");
-        const isAuthPath = url.pathname.startsWith("/api/auth/");
+        const method = request.method.toUpperCase();
         const sessionEnabled = typeof env.ADMIN_SESSION_KEY === "string" && env.ADMIN_SESSION_KEY.length > 0;
 
-        if (sessionEnabled && !isAuthPath) {
+        // Reset paths require the existing login method (Cloudflare Access) to verify identity.
+        if (url.pathname === "/reset" || url.pathname === "/reset.html" || url.pathname === "/api/auth/reset") {
+          const identity = await validateAccess(request, {
+            teamDomain: env.ACCESS_TEAM_DOMAIN,
+            audience: env.ACCESS_AUD,
+            adminEmails: env.ADMIN_EMAILS,
+          }, dependencies.jwks);
+          if (!isApi) {
+            requireMethod(method, "GET");
+            return secure(pageHtml(RESET_PAGE));
+          }
+          requireMethod(method, "POST");
+          rejectQuery(url, new Set());
+          requireSameOrigin(request, env.ADMIN_ORIGIN);
+          const body = await readObject(request, new Set(["newPassword", "turnstileToken"]));
+          const newPassword = requireString(body, "newPassword", 128);
+          const turnstileToken = typeof body.turnstileToken === "string" ? body.turnstileToken : "";
+          if (env.TURNSTILE_SECRET_KEY !== undefined && !(await verifyTurnstile(env.TURNSTILE_SECRET_KEY, turnstileToken, request))) {
+            throw new HttpError(400, "INVALID_TURNSTILE");
+          }
+          await env.CORE.setAdminPassword(identity, newPassword);
+          return json({ ok: true }, 200, { "Set-Cookie": await issueAdminSession(env.ADMIN_SESSION_KEY!) });
+        }
+
+        // Login page status, login, and logout do not require a session.
+        const openAuth = url.pathname === "/api/auth/status"
+          || url.pathname === "/api/auth/login"
+          || url.pathname === "/api/auth/logout";
+
+        if (sessionEnabled && !openAuth) {
           const authenticated = await adminSessionValid(request, env.ADMIN_SESSION_KEY!);
           if (!authenticated) {
             if (isApi) {
@@ -89,14 +114,13 @@ export function createAdminHandler(dependencies: { jwks?: JWTVerifyGetKey } = {}
             if (path !== "/" && path !== "/login" && path !== "/login.html" && !path.startsWith("/assets/")) {
               return secure(await env.ASSETS.fetch(request));
             }
-            return secure(await env.ASSETS.fetch(new Request("https://admin/login.html", request)));
+            return secure(pageHtml(LOGIN_PAGE));
           }
         }
 
         if (!isApi) {
           return secure(await env.ASSETS.fetch(request));
         }
-        const method = request.method.toUpperCase();
         if (url.pathname === "/api/auth/status") {
           requireMethod(method, "GET");
           return json({
@@ -121,19 +145,6 @@ export function createAdminHandler(dependencies: { jwks?: JWTVerifyGetKey } = {}
           }
           return json({ ok: true }, 200, { "Set-Cookie": await issueAdminSession(env.ADMIN_SESSION_KEY!) });
         }
-        if (url.pathname === "/api/auth/reset") {
-          requireMethod(method, "POST");
-          rejectQuery(url, new Set());
-          requireSameOrigin(request, env.ADMIN_ORIGIN);
-          const body = await readObject(request, new Set(["newPassword", "turnstileToken"]));
-          const newPassword = requireString(body, "newPassword", 128);
-          const turnstileToken = typeof body.turnstileToken === "string" ? body.turnstileToken : "";
-          if (env.TURNSTILE_SECRET_KEY !== undefined && !(await verifyTurnstile(env.TURNSTILE_SECRET_KEY, turnstileToken, request))) {
-            throw new HttpError(400, "INVALID_TURNSTILE");
-          }
-          await env.CORE.setAdminPassword(identity, newPassword);
-          return json({ ok: true }, 200, { "Set-Cookie": await issueAdminSession(env.ADMIN_SESSION_KEY!) });
-        }
         if (url.pathname === "/api/auth/logout") {
           requireMethod(method, "POST");
           rejectQuery(url, new Set());
@@ -142,6 +153,7 @@ export function createAdminHandler(dependencies: { jwks?: JWTVerifyGetKey } = {}
         if (["POST", "PUT", "DELETE"].includes(method) && !validateCsrf(request, env.ADMIN_ORIGIN)) {
           throw new HttpError(403, "FORBIDDEN");
         }
+        const identity = { subject: "password-admin", email: "" };
         return secure(await route(request, url, method, identity, env.CORE));
       } catch (error) {
         if (error instanceof AccessError) return secure(json({ error: "UNAUTHORIZED" }, 401));
@@ -402,6 +414,10 @@ function secure(response: Response): Response {
   for (const [key, value] of Object.entries(SECURITY_HEADERS)) headers.set(key, value);
   headers.set("Cache-Control", "no-store");
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function pageHtml(html: string): Response {
+  return new Response(html, { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
 function validateCursor(

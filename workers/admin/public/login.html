@@ -2,12 +2,12 @@
 <main>
   <button id="lang" class="toggle" type="button">EN</button>
   <h1 id="title">邮箱管理后台</h1>
-  <p class="hint" id="subtitle">设置后台密码</p>
+  <p class="hint" id="subtitle">密码登录</p>
   <form id="auth-form">
-    <label id="pwd-label" for="pwd"><span id="pwd-label-text">新密码</span><input id="pwd" type="password" maxlength="128" required autocomplete="new-password"></label>
-    <button id="submit" type="submit">设置并进入</button>
+    <label id="pwd-label" for="pwd"><span id="pwd-label-text">密码</span><input id="pwd" type="password" maxlength="128" required autocomplete="current-password"></label>
+    <button id="submit" type="submit">登录</button>
   </form>
-  <div class="mode" id="mode-row"><span id="mode-text"></span><button id="mode-toggle" type="button"></button></div>
+  <div class="mode" id="mode-row"><span id="mode-text"></span><a id="mode-link" href="/reset"></a></div>
   <p class="error" id="error" aria-live="polite"></p>
 </main>
 <script src="/login.js"></script>

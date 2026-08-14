@@ -96,18 +96,16 @@ async function mutate(s: ReturnType<typeof setup>, path: string, method: string,
 }
 
 describe("Admin worker", () => {
-  it("authenticates static assets before fetching and applies security headers", async () => {
-    const s = setup();
-    expect((await s.fetch(new Request(`${ORIGIN}/`))).status).toBe(401);
-    expect(s.ASSETS.fetch).not.toHaveBeenCalled();
-    for (const path of ["/", "/app.js", "/app.css"]) {
-      const response = await s.fetch(authRequest(path));
-      expect(await response.text()).toBe("asset");
-      expect(response.headers.get("Content-Security-Policy")).toContain("frame-ancestors 'none'");
-      expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
-      expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
-      expect(response.headers.get("Cache-Control")).toBe("no-store");
-    }
+  it("serves the login page when the password gate is enabled and applies security headers", async () => {
+    const s = setup({ ADMIN_SESSION_KEY: "session-secret-123" });
+    const response = await s.fetch(new Request(`${ORIGIN}/`));
+    expect(response.status).toBe(200);
+    expect((await response.text())).toContain("auth-form");
+    expect(response.headers.get("Content-Security-Policy")).toContain("frame-ancestors 'none'");
+    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect((await s.fetch(authRequest("/api/mailboxes"))).status).toBe(401);
   });
   it("issues a host-only 32-byte CSRF cookie", async () => {
     const s = setup(); const response = await s.fetch(authRequest()); const data = await response.json() as { csrfToken: string };
@@ -129,7 +127,7 @@ describe("Admin worker", () => {
     const mailboxCursor = btoa(JSON.stringify({ sort:"email", direction:"asc", value:"a@example.com", publicId:"m1" }));
     const auditCursor = btoa(JSON.stringify({ createdAt:"2026-08-13T00:00:00.000Z", id:"a1" }));
     expect((await s.fetch(authRequest(`/api/mailboxes?limit=100&status=active&domain=example.com&sort=email&direction=asc&search=a&cursor=${encodeURIComponent(mailboxCursor)}`))).status).toBe(200);
-    expect(s.CORE.pageMailboxes).toHaveBeenCalledWith({ subject: "access-user", email: "admin@example.com" }, { limit: 100, status: "active", domain: "example.com", sort:"email", direction:"asc", search:"a", cursor:mailboxCursor });
+    expect(s.CORE.pageMailboxes).toHaveBeenCalledWith({ subject: "password-admin", email: "" }, { limit: 100, status: "active", domain: "example.com", sort:"email", direction:"asc", search:"a", cursor:mailboxCursor });
     for (const [path, spy] of [["/api/domains", s.CORE.listDomains], ["/api/settings", s.CORE.getSettings], ["/api/tokens", s.CORE.listApiTokens], [`/api/audit?limit=2&cursor=${encodeURIComponent(auditCursor)}`, s.CORE.pageAudit]] as const) {
       expect((await s.fetch(authRequest(path))).status).toBe(200); expect(spy).toHaveBeenCalled();
     }
@@ -144,7 +142,7 @@ describe("Admin worker", () => {
     expect(s.CORE.pageAudit).not.toHaveBeenCalled();
   });
   it("maps every mutation and never caches password responses", async () => {
-    const s = setup(); const id: AdminIdentity = { subject: "access-user", email: "admin@example.com" };
+    const s = setup(); const id: AdminIdentity = { subject: "password-admin", email: "" };
     const cases: [string,string,unknown,ReturnType<typeof vi.fn>][] = [
       ["/api/mailboxes/m1/reveal","POST",{},s.CORE.revealPassword], ["/api/mailboxes/m1/reset","POST",{},s.CORE.resetPassword], ["/api/mailboxes/m1","DELETE",{ confirmationEmail:" a@example.com " },s.CORE.deleteMailbox],
       ["/api/domains/sync","POST",{},s.CORE.syncDomains], ["/api/domains/default","PUT",{ domain:"example.com" },s.CORE.setDefaultDomain], ["/api/settings","PUT",{ mailboxQuotaMb:100 },s.CORE.updateSettings],
