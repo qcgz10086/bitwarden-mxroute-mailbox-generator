@@ -259,6 +259,24 @@ describe("AdministrationService password state machine", () => {
     await expectAdminError(service.revealPassword(ADMIN, "mbx-1"), "INVALID_STATE");
   });
 
+  it("sets and clears a mailbox note with an audit trail and rejects unknown mailboxes", async () => {
+    await seedMailbox();
+    const service = adminService();
+
+    await service.setMailboxNote(ADMIN, "mbx-1", "primary backup mailbox");
+    const afterSet = await env.DB.prepare("SELECT note FROM mailboxes WHERE public_id = 'mbx-1'").first<{ note: string | null }>();
+    expect(afterSet?.note).toBe("primary backup mailbox");
+    const audit = await env.DB.prepare("SELECT * FROM audit_events WHERE action = 'mailbox.note'").first<Record<string, unknown>>();
+    expect(audit).toMatchObject({ actor_type: "admin", actor_id: ADMIN.subject, actor_email: ADMIN.email, action: "mailbox.note", result: "success", email: EMAIL });
+    expect(JSON.stringify(audit)).not.toContain("primary backup mailbox");
+
+    await service.setMailboxNote(ADMIN, "mbx-1", null);
+    const afterClear = await env.DB.prepare("SELECT note FROM mailboxes WHERE public_id = 'mbx-1'").first<{ note: string | null }>();
+    expect(afterClear?.note).toBeNull();
+
+    await expectAdminError(service.setMailboxNote(ADMIN, "mbx-missing", "x"), "NOT_FOUND");
+  });
+
   it.each(["corrupt ciphertext", "missing key"])(
     "records one failure and no success for reveal with %s",
     async (failure) => {

@@ -1,5 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import type { MailboxPage, MailboxStatus, MailboxSummary } from "../../packages/contracts/src/index";
+
+// i18n reads localStorage in the browser; default the tests to English so the
+// existing assertions keep matching while the app defaults to Chinese.
+(globalThis as { localStorage?: { getItem(key: string): string | null; setItem(key: string, value: string): void } }).localStorage = {
+  getItem: () => "en",
+  setItem: () => undefined,
+};
+
 import {
   AdminApi,
   RecoveryPager,
@@ -27,6 +35,7 @@ const mailbox: MailboxSummary = {
   status: "active",
   createdAt: "2026-08-13T00:00:00.000Z",
   failureCode: null,
+  note: null,
 };
 
 describe("admin UI safe helpers", () => {

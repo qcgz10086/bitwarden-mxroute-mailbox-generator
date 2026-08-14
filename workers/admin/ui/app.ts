@@ -1,12 +1,15 @@
 import type { MailboxPage, MailboxStatus, MailboxSummary } from "../../../packages/contracts/src/index";
+import { currentLanguage, setLanguage, t, tf } from "./i18n";
 
 declare const document: any;
 declare const window: any;
+declare const localStorage: { getItem(key: string): string | null; setItem(key: string, value: string): void };
 declare const navigator: { clipboard: { writeText(value: string): Promise<void> } };
 declare function confirm(message: string): boolean;
 declare const Option: new (text?: string, value?: string) => any;
 type HTMLElement = any;
 type HTMLInputElement = any;
+type HTMLTextAreaElement = any;
 type HTMLSelectElement = any;
 type HTMLTableRowElement = any;
 type HTMLTableCellElement = any;
@@ -211,9 +214,9 @@ export class TokenCreationWorkflow {
 export interface SettingsInput { mailboxQuotaMb: number; dailyCreationLimit: number; totalManagedLimit: number; }
 export function validateSettingsInput(value: SettingsInput): string[] {
   const errors: string[] = [];
-  if (!Number.isInteger(value.mailboxQuotaMb) || value.mailboxQuotaMb < 1 || value.mailboxQuotaMb > 102_400) errors.push("Mailbox quota must be an integer from 1 to 102400 MB.");
-  if (!Number.isInteger(value.dailyCreationLimit) || value.dailyCreationLimit < 1 || value.dailyCreationLimit > 1_000) errors.push("Daily creation limit must be an integer from 1 to 1000.");
-  if (!Number.isInteger(value.totalManagedLimit) || value.totalManagedLimit < 1 || value.totalManagedLimit > 100_000) errors.push("Total managed limit must be an integer from 1 to 100000.");
+  if (!Number.isInteger(value.mailboxQuotaMb) || value.mailboxQuotaMb < 1 || value.mailboxQuotaMb > 102_400) errors.push(t("settingsQuotaError"));
+  if (!Number.isInteger(value.dailyCreationLimit) || value.dailyCreationLimit < 1 || value.dailyCreationLimit > 1_000) errors.push(t("settingsDailyError"));
+  if (!Number.isInteger(value.totalManagedLimit) || value.totalManagedLimit < 1 || value.totalManagedLimit > 100_000) errors.push(t("settingsTotalError"));
   return errors;
 }
 
@@ -240,7 +243,7 @@ export class AdminApi {
     if (!path.startsWith("/api/") || (path[0] === "/" && path[1] === "/") || path.includes("\\")) throw new Error("Only same-origin API paths are allowed.");
     const response = await this.fetcher(path, { ...init, credentials: "same-origin", headers: { Accept: "application/json", ...init.headers } });
     const data = await response.json().catch(() => ({})) as Record<string, unknown>;
-    if (!response.ok) throw new Error(`Request failed (${typeof data.error === "string" ? data.error : response.status}).`);
+    if (!response.ok) throw new Error(tf("requestFailed", { message: typeof data.error === "string" ? data.error : response.status }));
     return data as T;
   }
 }
@@ -249,7 +252,9 @@ interface Domain { domain: string; active: boolean; syncedAt: string; }
 interface Settings extends SettingsInput { defaultDomain: string | null; prefixLength: number; generationEnabled: boolean; }
 interface ApiToken { id: string; name: string; createdAt: string; lastUsedAt: string | null; revokedAt: string | null; status: "pending" | "active" | "revoked"; pendingExpiresAt: string | null; }
 export function formatTokenStatus(token: Pick<ApiToken,"status" | "pendingExpiresAt">): string {
-  return token.status === "pending" ? `Pending until ${token.pendingExpiresAt ?? "expiry unavailable"}` : token.status === "active" ? "Active" : "Revoked";
+  return token.status === "pending"
+    ? tf("tokenPendingUntil", { time: token.pendingExpiresAt ?? t("tokenExpiryUnavailable") })
+    : token.status === "active" ? t("tokenActive") : t("tokenRevoked");
 }
 interface AuditRecord { id: string; actorType: string; actorId: string; actorEmail: string | null; action: string; email: string | null; result: string; errorCode: string | null; requestId: string; createdAt: string; }
 
@@ -307,7 +312,7 @@ function button(label: string, action: () => void | Promise<void>, danger = fals
   const node = document.createElement("button"); node.type = "button"; text(node, label); if (danger) node.className = "danger";
   node.addEventListener("click", () => { void runAction(action, fail); }); return node;
 }
-function fail(error: unknown): void { status(error instanceof Error ? error.message : "Request failed."); }
+function fail(error: unknown): void { status(error instanceof Error ? error.message : t("requestFailedGeneric")); }
 
 async function loadMailboxes(cursor?: string): Promise<void> {
   concealAllMailboxSecrets(); clearMailboxSecrets.clear();
@@ -319,12 +324,13 @@ async function loadMailboxes(cursor?: string): Promise<void> {
   const page = await api.get<MailboxPage>(`/api/mailboxes?${params}`); mailboxCursor = page.nextCursor;
   const body = byId<HTMLTableSectionElement>("mailbox-rows"); body.replaceChildren();
   for (const mailbox of page.items) renderMailbox(body, mailbox);
-  byId<HTMLButtonElement>("mailbox-next").disabled = !mailboxCursor; status(`Loaded ${page.items.length} mailboxes.`);
+  byId<HTMLButtonElement>("mailbox-next").disabled = !mailboxCursor; status(tf("loadedMailboxes", { count: page.items.length }));
 }
 
 function renderMailbox(body: HTMLTableSectionElement, mailbox: MailboxSummary): void {
   const row = body.insertRow(); const display = formatMailboxRow(mailbox);
   cell(row, display.email); cell(row, display.domain); cell(row, display.quota); cell(row, display.status); cell(row, display.created);
+  cell(row, mailbox.note ?? "—");
   const passwordCell = cell(row, "••••••••••••••••••"); passwordCell.className = "secret";
   const secret = new SecretCellController(passwordCell, () => row.isConnected && !document.hidden);
   clearMailboxSecrets.add(() => secret.conceal());
@@ -332,13 +338,14 @@ function renderMailbox(body: HTMLTableSectionElement, mailbox: MailboxSummary): 
     const ticket = secret.begin();
     try {
       const result = await api.mutate<{ password: string }>(`/api/mailboxes/${encodeURIComponent(mailbox.publicId)}/${kind}`, "POST", {}, ticket.signal);
-      if (ticket.accept(result.password)) status(`${kind === "reset" ? "New" : "Mailbox"} password shown for ${mailbox.email}; it will clear in 5 minutes.`);
+      if (ticket.accept(result.password)) status(tf(kind === "reset" ? "newPasswordShown" : "passwordShown", { email: mailbox.email }));
     } catch (error) { if (!ticket.signal.aborted) throw error; }
   };
   const actions = row.insertCell(); actions.className = "actions";
-  actions.append(button("Reveal", () => requestPassword("reveal")), button("Copy", async () => { if (!await secret.copyTo((value) => navigator.clipboard.writeText(value))) return status("Reveal the password before copying."); status("Password copied."); }), button("Hide", () => secret.conceal()));
-  actions.append(button("Reset", async () => { if (confirm(`Reset the password for ${mailbox.email}?`)) await requestPassword("reset"); }, true));
-  actions.append(button("Delete", () => openDelete(mailbox, () => secret.conceal()), true));
+  actions.append(button(t("btnReveal"), () => requestPassword("reveal")), button(t("btnCopy"), async () => { if (!await secret.copyTo((value) => navigator.clipboard.writeText(value))) return status(t("revealBeforeCopy")); status(t("passwordCopied")); }), button(t("btnHide"), () => secret.conceal()));
+  actions.append(button(t("btnReset"), async () => { if (confirm(tf("confirmResetPassword", { email: mailbox.email }))) await requestPassword("reset"); }, true));
+  actions.append(button(t("btnEditNote"), () => openNoteDialog(mailbox)));
+  actions.append(button(t("btnDelete"), () => openDelete(mailbox, () => secret.conceal()), true));
   row.addEventListener("focusout", (event: { relatedTarget: Node | null }) => {
     const target = event.relatedTarget as HTMLElement | null;
     const targetRow = target?.closest?.("tr") ?? null;
@@ -351,12 +358,17 @@ function openDelete(mailbox: MailboxSummary, conceal: () => void): void {
   text(byId("delete-email"), mailbox.email); input.value = ""; input.dataset.email = mailbox.email; input.dataset.id = mailbox.publicId; dialog.showModal(); input.focus();
 }
 
+function openNoteDialog(mailbox: MailboxSummary): void {
+  concealAllMailboxSecrets(); const dialog = byId<HTMLDialogElement>("note-dialog"); const input = byId<HTMLTextAreaElement>("note-input");
+  input.value = mailbox.note ?? ""; input.dataset.id = mailbox.publicId; input.dataset.email = mailbox.email; dialog.showModal(); input.focus();
+}
+
 async function loadDomains(): Promise<void> {
   domains = await api.get<readonly Domain[]>("/api/domains"); const body = byId<HTMLTableSectionElement>("domain-rows"); body.replaceChildren();
-  const filter = byId<HTMLSelectElement>("mailbox-domain"); const selected = filter.value; filter.replaceChildren(new Option("All domains", ""));
+  const filter = byId<HTMLSelectElement>("mailbox-domain"); const selected = filter.value; filter.replaceChildren(new Option(t("optionAllDomains"), ""));
   const active = new Set(activeDomainNames(domains));
-  for (const domain of domains) { const row = body.insertRow(); cell(row, domain.domain); cell(row, domain.active ? "Active" : "Inactive"); cell(row, domain.syncedAt); if (active.has(domain.domain)) filter.append(new Option(domain.domain, domain.domain)); }
-  filter.value = selected; status(`Loaded ${domains.length} domains.`);
+  for (const domain of domains) { const row = body.insertRow(); cell(row, domain.domain); cell(row, domain.active ? t("stateActive") : t("stateInactive")); cell(row, domain.syncedAt); if (active.has(domain.domain)) filter.append(new Option(domain.domain, domain.domain)); }
+  filter.value = selected; status(tf("loadedDomains", { count: domains.length }));
 }
 
 async function loadSettings(): Promise<void> {
@@ -367,7 +379,7 @@ async function loadSettings(): Promise<void> {
 
 async function loadTokens(): Promise<void> {
   const tokens = await api.get<readonly ApiToken[]>("/api/tokens"); const body = byId<HTMLTableSectionElement>("token-rows"); body.replaceChildren();
-  for (const token of tokens) { const row = body.insertRow(); cell(row, token.name); cell(row, token.createdAt); cell(row, token.lastUsedAt ?? "Never"); cell(row, formatTokenStatus(token)); const actions = row.insertCell(); if (token.status !== "revoked") actions.append(button("Revoke", async () => { if (!confirm(`Revoke token ${token.name}?`)) return; await api.mutate(`/api/tokens/${encodeURIComponent(token.id)}`, "DELETE"); await loadTokens(); }, true)); }
+  for (const token of tokens) { const row = body.insertRow(); cell(row, token.name); cell(row, token.createdAt); cell(row, token.lastUsedAt ?? "Never"); cell(row, formatTokenStatus(token)); const actions = row.insertCell(); if (token.status !== "revoked") actions.append(button(t("btnRevoke"), async () => { if (!confirm(tf("confirmRevokeToken", { name: token.name }))) return; await api.mutate(`/api/tokens/${encodeURIComponent(token.id)}`, "DELETE"); await loadTokens(); }, true)); }
 }
 
 async function loadAudit(cursor?: string): Promise<void> {
@@ -379,7 +391,7 @@ function renderRecovery(): void {
   const body = byId<HTMLTableSectionElement>("recovery-rows"); body.replaceChildren();
   for (const state of recoveryStatuses) for (const item of recoveryPager.items(state)) { const row = body.insertRow(); cell(row, item.email); cell(row, item.status); cell(row, item.failureCode ?? "—"); cell(row, item.createdAt); }
   const more = recoveryPager.statusesWithMore(); byId<HTMLButtonElement>("recovery-more").disabled = more.length === 0;
-  text(byId("recovery-truncation"), more.length ? `More records are available for: ${more.join(", ")}.` : "All recovery records are displayed.");
+  text(byId("recovery-truncation"), more.length ? tf("recoveryMoreAvailable", { statuses: more.join(", ") }) : t("recoveryAllDisplayed"));
 }
 async function loadRecovery(): Promise<void> { await recoveryPager.loadInitial(); renderRecovery(); }
 async function loadMoreRecovery(): Promise<void> {
@@ -396,27 +408,29 @@ function bind(): void {
     clear: () => { text(byId("raw-token"), ""); tokenButton.disabled = false; },
     report: (code) => {
       const messages = {
-        TOKEN_CREATE_FAILED: "Token creation failed.",
-        TOKEN_COMPENSATION_FAILED: "Token could not be safely revoked; revoke it from the token list.",
-        TOKEN_DISPLAY_FAILED_COMPENSATED: "Token display failed, so the created token was revoked. Create a new token.",
-        TOKEN_DISPLAY_FAILED_COMPENSATION_FAILED: "Token display failed and automatic revocation failed; revoke the newest token from the token list.",
+        TOKEN_CREATE_FAILED: t("tokenCreateFailed"),
+        TOKEN_COMPENSATION_FAILED: t("tokenCompensationFailed"),
+        TOKEN_DISPLAY_FAILED_COMPENSATED: t("tokenDisplayCompensated"),
+        TOKEN_DISPLAY_FAILED_COMPENSATION_FAILED: t("tokenDisplayCompensationFailed"),
       } as const;
       status(messages[code]);
     },
   });
   byId("mailbox-filter").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); void loadMailboxes().catch(fail); }); byId("mailbox-next").addEventListener("click", () => { if (mailboxCursor) void loadMailboxes(mailboxCursor).catch(fail); });
   byId("sync-domains").addEventListener("click", () => void api.mutate<readonly Domain[]>("/api/domains/sync", "POST").then(async () => { await loadDomains(); await loadSettings(); }).catch(fail));
-  byId("default-domain-form").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); const domain = byId<HTMLSelectElement>("default-domain").value; if (!domains.some((item) => item.active && item.domain === domain)) return status("Choose an active domain."); void api.mutate("/api/domains/default", "PUT", { domain }).then(() => status("Default domain saved.")).catch(fail); });
-  byId("settings-form").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); const value = { mailboxQuotaMb: Number(byId<HTMLInputElement>("quota").value), dailyCreationLimit: Number(byId<HTMLInputElement>("daily-limit").value), totalManagedLimit: Number(byId<HTMLInputElement>("total-limit").value) }; const errors = validateSettingsInput(value); if (errors.length) return status(errors.join(" ")); void api.mutate("/api/settings", "PUT", { ...value, generationEnabled: byId<HTMLInputElement>("generation-enabled").checked }).then(() => status("Settings saved.")).catch(fail); });
+  byId("default-domain-form").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); const domain = byId<HTMLSelectElement>("default-domain").value; if (!domains.some((item) => item.active && item.domain === domain)) return status(t("chooseActiveDomain")); void api.mutate("/api/domains/default", "PUT", { domain }).then(() => status(t("defaultDomainSaved"))).catch(fail); });
+  byId("settings-form").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); const value = { mailboxQuotaMb: Number(byId<HTMLInputElement>("quota").value), dailyCreationLimit: Number(byId<HTMLInputElement>("daily-limit").value), totalManagedLimit: Number(byId<HTMLInputElement>("total-limit").value) }; const errors = validateSettingsInput(value); if (errors.length) return status(errors.join(" ")); void api.mutate("/api/settings", "PUT", { ...value, generationEnabled: byId<HTMLInputElement>("generation-enabled").checked }).then(() => status(t("settingsSaved"))).catch(fail); });
   byId("token-form").addEventListener("submit", (event: { preventDefault(): void }) => {
     event.preventDefault(); const name = byId<HTMLInputElement>("token-name").value.trim(); if (!name) return;
-    if (tokenWorkflow.busy()) return status("Save or dismiss the current token before creating another."); tokenButton.disabled = true;
+    if (tokenWorkflow.busy()) return status(t("tokenBusy")); tokenButton.disabled = true;
     void tokenWorkflow.create(name).then(async (result) => { tokenButton.disabled = tokenWorkflow.busy(); if (result !== "failed" && result !== "busy") await loadTokens(); }).catch(fail);
   });
-  byId("copy-token").addEventListener("click", () => { void tokenWorkflow.copyTo((value) => navigator.clipboard.writeText(value)).then((copied) => { if (copied) status("Token copied and marked as saved."); }).catch(fail); });
+  byId("copy-token").addEventListener("click", () => { void tokenWorkflow.copyTo((value) => navigator.clipboard.writeText(value)).then((copied) => { if (copied) status(t("tokenCopied")); }).catch(fail); });
+  byId("note-form").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); const input = byId<HTMLTextAreaElement>("note-input"); void api.mutate(`/api/mailboxes/${encodeURIComponent(input.dataset.id ?? "")}/note`, "PUT", { note: input.value }).then(async () => { byId<HTMLDialogElement>("note-dialog").close(); await loadMailboxes(); status(input.value.trim() ? t("noteSaved") : t("noteCleared")); }).catch(fail); });
+  byId("cancel-note").addEventListener("click", () => byId<HTMLDialogElement>("note-dialog").close());
   tokenDialog.addEventListener("close", () => tokenWorkflow.closeWithoutSave());
   byId("dismiss-token").addEventListener("click", () => { void tokenWorkflow.dismissSaved().then(() => tokenDialog.close()).catch(fail); });
-  byId("delete-form").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); const input = byId<HTMLInputElement>("delete-confirmation"); void performExactDelete(input.dataset.id ?? "", input.dataset.email ?? "", input.value, (path, method, body) => api.mutate(path, method, body), () => byId<HTMLDialogElement>("delete-dialog").close()).then(async (deleted) => { if (!deleted) return status("Type the complete email address exactly."); await loadMailboxes(); await loadRecovery(); status("Mailbox permanently deleted."); }).catch(fail); });
+  byId("delete-form").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); const input = byId<HTMLInputElement>("delete-confirmation"); void performExactDelete(input.dataset.id ?? "", input.dataset.email ?? "", input.value, (path, method, body) => api.mutate(path, method, body), () => byId<HTMLDialogElement>("delete-dialog").close()).then(async (deleted) => { if (!deleted) return status(t("typeExactEmail")); await loadMailboxes(); await loadRecovery(); status(t("mailboxDeleted")); }).catch(fail); });
   const refreshButton = byId<HTMLButtonElement>("refresh-recovery"); const moreButton = byId<HTMLButtonElement>("recovery-more");
   byId("cancel-delete").addEventListener("click", () => byId<HTMLDialogElement>("delete-dialog").close()); byId("audit-next").addEventListener("click", () => { if (auditCursor) void loadAudit(auditCursor).catch(fail); });
   refreshButton.addEventListener("click", () => void runDisabled(refreshButton, async () => { moreButton.disabled = true; await recoveryPager.refresh(); renderRecovery(); }).catch(fail));
@@ -424,5 +438,30 @@ function bind(): void {
   bindSensitiveLifecycleEvents({ visibility: document, navigation: window, tokenDialog: { addEventListener: () => undefined }, isHidden: () => document.hidden }, concealAllMailboxSecrets, () => { tokenWorkflow.pagehide(); void tokenWorkflow.compensation(); });
 }
 
-async function start(): Promise<void> { bind(); await api.initialize(); await loadDomains(); await Promise.all([loadMailboxes(), loadSettings(), loadTokens(), loadAudit(), loadRecovery()]); status("Management data loaded."); }
+function applyStaticTranslations(): void {
+  document.documentElement.lang = currentLanguage();
+  document.title = t("title");
+  for (const node of document.querySelectorAll("[data-i18n]")) text(node, t(node.dataset.i18n));
+  for (const node of document.querySelectorAll("[data-i18n-placeholder]")) node.placeholder = t(node.dataset.i18nPlaceholder);
+  text(byId("lang-toggle"), t("langToggle"));
+}
+
+async function refreshDynamicContent(): Promise<void> {
+  await loadDomains();
+  await Promise.all([loadMailboxes(), loadSettings(), loadTokens(), loadAudit(), loadRecovery()]);
+}
+
+async function start(): Promise<void> {
+  applyStaticTranslations();
+  bind();
+  byId("lang-toggle").addEventListener("click", () => {
+    setLanguage(currentLanguage() === "zh" ? "en" : "zh");
+    applyStaticTranslations();
+    void refreshDynamicContent().catch(fail);
+  });
+  await api.initialize();
+  await loadDomains();
+  await Promise.all([loadMailboxes(), loadSettings(), loadTokens(), loadAudit(), loadRecovery()]);
+  status(t("dataLoaded"));
+}
 if (typeof document !== "undefined") void start().catch(fail);

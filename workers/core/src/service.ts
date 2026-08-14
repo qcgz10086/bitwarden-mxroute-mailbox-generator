@@ -493,6 +493,20 @@ export class AdministrationService {
     });
   }
 
+  async setMailboxNote(identity: AdminIdentity, publicId: string, note: string | null): Promise<{ requestId: string }> {
+    const requestId = this.createId("request");
+    const mailbox = await this.requireMailbox(publicId, requestId, identity, "mailbox.note");
+    try {
+      await this.dependencies.repository.setMailboxNoteWithAudit(publicId, note,
+        this.adminEvent(identity,"mailbox.note",mailbox.email,"success",null,requestId));
+      return { requestId };
+    } catch (error) {
+      const code = repositoryAdminCode(error);
+      await this.audit(identity, "mailbox.note", mailbox.email, "failure", code, requestId);
+      throw new AdminError(code, requestId);
+    }
+  }
+
   async updateSettings(identity: AdminIdentity, patch: AdminSettingsPatch): Promise<{ requestId: string }> {
     return this.adminMutation(identity, "settings.update", null, async (event) => {
       validateSettings(patch);

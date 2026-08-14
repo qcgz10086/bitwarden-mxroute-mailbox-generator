@@ -195,6 +195,7 @@ type MailboxSummaryRow = {
   status: MailboxStatus;
   created_at: string;
   failure_code: string | null;
+  note: string | null;
   sort_value: string;
 };
 
@@ -449,6 +450,7 @@ export class Repository {
         status,
         created_at,
         failure_code,
+        note,
         ${sortColumn} AS sort_value
       FROM mailboxes
       ${where}
@@ -664,6 +666,14 @@ export class Repository {
       if (error instanceof RepositoryError && error.code === "INVALID_STATE") throw new RepositoryError("INACTIVE_DOMAIN");
       throw error;
     }
+  }
+
+  async setMailboxNoteWithAudit(publicId: string, note: string | null, event: AuditEventInput): Promise<void> {
+    await this.mutateWithAudit(
+      this.db.prepare(`UPDATE mailboxes SET note=?,updated_at=? WHERE public_id=?`)
+        .bind(note, event.createdAt, publicId),
+      event,
+    );
   }
 
   async getSettings(): Promise<RepositorySettings> {
@@ -1020,6 +1030,7 @@ function mapMailboxSummary(row: MailboxSummaryRow): MailboxSummary {
     status: row.status,
     createdAt: row.created_at,
     failureCode: row.failure_code,
+    note: row.note,
   };
 }
 

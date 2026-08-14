@@ -57,6 +57,7 @@ function coreDouble() {
     revealPassword: vi.fn(async () => ({ password: "Secret123", requestId: "r1" })),
     resetPassword: vi.fn(async () => ({ password: "NewSecret123", requestId: "r2" })),
     deleteMailbox: vi.fn(async () => ({ requestId: "r3" })),
+    setMailboxNote: vi.fn(async () => ({ requestId: "r8" })),
     listDomains: vi.fn(async () => []), syncDomains: vi.fn(async () => []),
     setDefaultDomain: vi.fn(async () => ({ requestId: "r4" })),
     getSettings: vi.fn(async () => ({ defaultDomain: null, mailboxQuotaMb: 100, prefixLength: 12, dailyCreationLimit: 30, totalManagedLimit: 500, generationEnabled: true })),
@@ -143,6 +144,7 @@ describe("Admin worker", () => {
     const cases: [string,string,unknown,ReturnType<typeof vi.fn>][] = [
       ["/api/mailboxes/m1/reveal","POST",{},s.CORE.revealPassword], ["/api/mailboxes/m1/reset","POST",{},s.CORE.resetPassword], ["/api/mailboxes/m1","DELETE",{ confirmationEmail:" a@example.com " },s.CORE.deleteMailbox],
       ["/api/domains/sync","POST",{},s.CORE.syncDomains], ["/api/domains/default","PUT",{ domain:"example.com" },s.CORE.setDefaultDomain], ["/api/settings","PUT",{ mailboxQuotaMb:100 },s.CORE.updateSettings],
+      ["/api/mailboxes/m1/note","PUT",{ note:" keepalive " },s.CORE.setMailboxNote],
       ["/api/tokens","POST",{ name:"phone", operationId:"operation-phone-0001" },s.CORE.createApiToken], ["/api/tokens/t1","DELETE",{},s.CORE.revokeApiToken],
       ["/api/tokens/t1/acknowledge","POST",{ operationId:"operation-phone-0001" },s.CORE.acknowledgeApiToken],
     ];
@@ -150,6 +152,7 @@ describe("Admin worker", () => {
     expect(s.CORE.deleteMailbox).toHaveBeenCalledWith(id,"m1"," a@example.com ");
     expect(s.CORE.revealPassword).toHaveBeenCalledWith(id,"m1");
     expect(s.CORE.resetPassword).toHaveBeenCalledWith(id,"m1");
+    expect(s.CORE.setMailboxNote).toHaveBeenCalledWith(id,"m1","keepalive");
     expect(s.CORE.syncDomains).toHaveBeenCalledWith(id);
     expect(s.CORE.setDefaultDomain).toHaveBeenCalledWith(id,"example.com");
     expect(s.CORE.updateSettings).toHaveBeenCalledWith(id,{ mailboxQuotaMb:100 });
@@ -158,7 +161,7 @@ describe("Admin worker", () => {
   });
   it("rejects missing confirmations, unexpected/invalid values, oversized bodies, methods and paths", async () => {
     const s = setup();
-    for (const [path,method,body] of [["/api/mailboxes/m1","DELETE",{}],["/api/domains/default","PUT",{domain:"bad domain"}],["/api/settings","PUT",{prefixLength:13}],["/api/settings","PUT",{evil:true}],["/api/tokens","POST",{name:""}]] as const) expect((await mutate(s,path,method,body)).status).toBe(400);
+    for (const [path,method,body] of [["/api/mailboxes/m1","DELETE",{}],["/api/domains/default","PUT",{domain:"bad domain"}],["/api/settings","PUT",{prefixLength:13}],["/api/settings","PUT",{evil:true}],["/api/tokens","POST",{name:""}],["/api/mailboxes/m1/note","PUT",{note:"x".repeat(501)}],["/api/mailboxes/m1/note","PUT",{unexpected:true}]] as const) expect((await mutate(s,path,method,body)).status).toBe(400);
     expect((await mutate(s,"/api/tokens","POST",{ name:"x".repeat(70_000) })).status).toBe(413);
     expect((await s.fetch(authRequest("/api"))).status).toBe(404);
     expect((await s.fetch(authRequest("/api/nope"))).status).toBe(404);

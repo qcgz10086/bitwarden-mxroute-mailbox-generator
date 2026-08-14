@@ -31,6 +31,7 @@ export interface AdminCore {
   revealPassword(identity: AdminIdentity, publicId: string): Promise<{ password: string; requestId: string }>;
   resetPassword(identity: AdminIdentity, publicId: string): Promise<{ password: string; requestId: string }>;
   deleteMailbox(identity: AdminIdentity, publicId: string, confirmationEmail: string): Promise<{ requestId: string }>;
+  setMailboxNote(identity: AdminIdentity, publicId: string, note: string | null): Promise<{ requestId: string }>;
   listDomains(identity: AdminIdentity): Promise<readonly DomainRecord[]>;
   syncDomains(identity: AdminIdentity): Promise<readonly DomainRecord[]>;
   setDefaultDomain(identity: AdminIdentity, domain: string): Promise<{ requestId: string }>;
@@ -106,6 +107,14 @@ async function route(request: Request, url: URL, method: string, identity: Admin
     return json(match[2] === "reveal"
       ? await core.revealPassword(identity, id)
       : await core.resetPassword(identity, id));
+  }
+  match = path.match(/^\/api\/mailboxes\/([^/]+)\/note$/);
+  if (match) {
+    requireMethod(method, "PUT");
+    rejectQuery(url, new Set());
+    const body = await readObject(request, new Set(["note"]));
+    const note = requireNullableString(body, "note", 500);
+    return json(await core.setMailboxNote(identity, decodeId(match[1]!), note));
   }
   match = path.match(/^\/api\/mailboxes\/([^/]+)$/);
   if (match) {
@@ -262,6 +271,14 @@ function requireString(body: Record<string, unknown>, key: string, maximum: numb
     throw new HttpError(400, "INVALID_INPUT");
   }
   return value.trim();
+}
+
+function requireNullableString(body: Record<string, unknown>, key: string, maximum: number): string | null {
+  const value = body[key];
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string" || value.length > maximum) throw new HttpError(400, "INVALID_INPUT");
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? null : trimmed;
 }
 
 function requireExactString(body: Record<string, unknown>, key: string, maximum: number): string {

@@ -29,6 +29,7 @@ export interface MailboxSummary {
   readonly status: MailboxStatus;
   readonly createdAt: string;
   readonly failureCode: string | null;
+  readonly note: string | null;
 }
 
 export interface MailboxPage {
