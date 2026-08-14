@@ -130,7 +130,5 @@ BEGIN
   WHERE date = OLD.reservation_date
     AND token_id = OLD.reservation_token_id
     AND count > 0;
-  SELECT CASE
-    WHEN changes() != 1 THEN RAISE(ABORT, 'RESERVATION_RELEASE')
-  END;
+  SELECT RAISE(ABORT, 'RESERVATION_RELEASE') WHERE changes() = 0;
 END;

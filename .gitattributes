@@ -1,0 +1,3 @@
+# SQL migrations must stay LF: Cloudflare D1's remote parser rejects
+# statements inside trigger bodies that use CRLF line endings.
+*.sql text eol=lf

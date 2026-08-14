@@ -49,7 +49,7 @@ function Assert-CloudflareAccount {
     if ($ids -notcontains $script:AccountIdLower) {
         throw 'The authenticated Wrangler profile does not expose the expected Cloudflare Account ID.'
     }
-    Write-Host "Cloudflare account $script:AccountIdLower: VERIFIED"
+    Write-Host "Cloudflare account ${script:AccountIdLower}: VERIFIED"
 }
 
 function Get-Names {
@@ -95,9 +95,11 @@ function Write-EnvironmentConfigs {
             database_id = $DatabaseId
             migrations_dir = "$relativeRoot/workers/core/migrations"
         })
-        secrets = [ordered]@{ required = @('MXROUTE_SERVER', 'MXROUTE_USERNAME', 'MXROUTE_API_KEY', 'TOKEN_PEPPER', 'ENC_KEY_V1') }
     }
-    if ($Final) { $core.triggers = [ordered]@{ crons = @('*/5 * * * *') } }
+    if ($Final) {
+        $core.secrets = [ordered]@{ required = @('MXROUTE_SERVER', 'MXROUTE_USERNAME', 'MXROUTE_API_KEY', 'TOKEN_PEPPER', 'ENC_KEY_V1') }
+        $core.triggers = [ordered]@{ crons = @('*/5 * * * *') }
+    }
 
     $namespaceBase = if ($Environment -eq 'production') { 1000 } else { 1100 }
     $generator = [ordered]@{
@@ -134,10 +136,10 @@ function Write-EnvironmentConfigs {
         }
     }
 
-    New-Item -ItemType Directory -Force -Path $script:ConfigDirectory | Out-Null
-    Set-Content -LiteralPath $script:CoreConfig -Value ($core | ConvertTo-Json -Depth 10) -Encoding utf8
-    Set-Content -LiteralPath $script:GeneratorConfig -Value ($generator | ConvertTo-Json -Depth 10) -Encoding utf8
-    Set-Content -LiteralPath $script:AdminConfig -Value ($admin | ConvertTo-Json -Depth 10) -Encoding utf8
+    [void][System.IO.Directory]::CreateDirectory($script:ConfigDirectory)
+    [System.IO.File]::WriteAllText($script:CoreConfig, ($core | ConvertTo-Json -Depth 10))
+    [System.IO.File]::WriteAllText($script:GeneratorConfig, ($generator | ConvertTo-Json -Depth 10))
+    [System.IO.File]::WriteAllText($script:AdminConfig, ($admin | ConvertTo-Json -Depth 10))
 }
 
 function Assert-EnvironmentConfigs {

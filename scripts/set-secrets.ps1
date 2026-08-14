@@ -154,7 +154,15 @@ try {
     foreach ($name in @('MXROUTE_SERVER', 'MXROUTE_USERNAME', 'MXROUTE_API_KEY')) {
         if (-not $RotateMxroute -and $existing -contains $name) { Write-Host "${name}: PRESENT"; continue }
         if (-not $PSCmdlet.ShouldProcess("$operationTarget secret=$name", 'Set secret through Wrangler stdin')) { Write-Host "${name}: WOULD SET"; continue }
-        $value = Read-Host "Enter $name" -AsSecureString
+        $value = $null
+        $fromEnv = [Environment]::GetEnvironmentVariable($name)
+        if (-not [string]::IsNullOrEmpty($fromEnv)) {
+            $value = [Security.SecureString]::new()
+            foreach ($ch in $fromEnv.ToCharArray()) { $value.AppendChar($ch) }
+            $fromEnv = $null
+        } else {
+            $value = Read-Host "Enter $name" -AsSecureString
+        }
         try {
             if ($value.Length -eq 0) { throw "$name cannot be empty." }
             Invoke-SecretPut -Name $name -SecureValue $value
