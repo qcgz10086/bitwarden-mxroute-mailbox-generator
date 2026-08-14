@@ -1,10 +1,10 @@
 (function () {
   var I18N = {
-    zh: { title: "邮箱管理后台", login: "密码登录", set: "首次使用：请设置后台密码", pwd: "密码", loginBtn: "登录", goSet: "设置密码", forgot: "忘记密码？", resetLink: "使用现有登录方式重置", empty: "请输入密码", loadFail: "加载失败", wrongPwd: "密码错误", turnstileFail: "人机验证未通过", requestFail: "请求失败" },
+    zh: { title: "邮箱管理后台", login: "密码登录", set: "首次使用：请设置后台密码", pwd: "密码", loginBtn: "登录", goSet: "设置后台密码", forgot: "忘记密码？", resetLink: "使用现有登录方式重置", empty: "请输入密码", loadFail: "加载失败", wrongPwd: "密码错误", turnstileFail: "人机验证未通过", requestFail: "请求失败" },
     en: { title: "Mailbox Administration", login: "Password login", set: "First run: set the admin password", pwd: "Password", loginBtn: "Log in", goSet: "Set password", forgot: "Forgot password?", resetLink: "Reset using the existing login", empty: "Enter a password", loadFail: "Failed to load", wrongPwd: "Wrong password", turnstileFail: "Verification failed", requestFail: "Request failed" }
   };
   var title = document.getElementById("title"), subtitle = document.getElementById("subtitle");
-  var pwdLabelText = document.getElementById("pwd-label-text"), pwd = document.getElementById("pwd");
+  var pwdLabel = document.getElementById("pwd-label"), pwd = document.getElementById("pwd");
   var submit = document.getElementById("submit"), error = document.getElementById("error");
   var modeRow = document.getElementById("mode-row"), modeText = document.getElementById("mode-text"), modeLink = document.getElementById("mode-link");
   var langBtn = document.getElementById("lang"), form = document.getElementById("auth-form");
@@ -16,11 +16,13 @@
     var s = I18N[lang];
     title.textContent = s.title;
     subtitle.textContent = passwordSet ? s.login : s.set;
-    pwdLabelText.textContent = s.pwd;
-    submit.textContent = passwordSet ? s.loginBtn : s.goSet;
-    modeRow.style.display = passwordSet ? "" : "none";
-    modeText.textContent = s.forgot;
-    modeLink.textContent = s.resetLink;
+    if (passwordSet) {
+      pwdLabel.style.display = ""; submit.textContent = s.loginBtn;
+      modeRow.style.display = ""; modeText.textContent = s.forgot; modeLink.textContent = s.resetLink;
+    } else {
+      pwdLabel.style.display = "none"; submit.textContent = s.goSet;
+      modeRow.style.display = "none";
+    }
   }
   langBtn.addEventListener("click", function () { setLang(lang === "zh" ? "en" : "zh"); });
 
