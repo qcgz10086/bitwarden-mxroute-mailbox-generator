@@ -61,7 +61,9 @@ export class MxrouteClient {
     private readonly credentials: MxrouteCredentials,
     dependencies: MxrouteClientDependencies = {},
   ) {
-    this.fetch = dependencies.fetch ?? fetch;
+    this.fetch = dependencies.fetch !== undefined
+      ? dependencies.fetch
+      : (input, init) => fetch(input, init);
     this.scheduleTimeout = dependencies.scheduleTimeout
       ?? ((callback, delayMs) => setTimeout(callback, delayMs));
     this.cancelTimeout = dependencies.cancelTimeout
