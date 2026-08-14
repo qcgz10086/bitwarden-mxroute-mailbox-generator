@@ -90,7 +90,7 @@ export class SecretCellController {
         if (accepted || request.signal.aborted || generation !== this.generation || !this.isCurrent()) return false;
         accepted = true;
         this.secret = value; text(this.node, value);
-        this.timer = this.setTimer(() => this.conceal(), 60_000);
+        this.timer = this.setTimer(() => this.conceal(), 300_000);
         return true;
       },
     };
@@ -332,14 +332,18 @@ function renderMailbox(body: HTMLTableSectionElement, mailbox: MailboxSummary): 
     const ticket = secret.begin();
     try {
       const result = await api.mutate<{ password: string }>(`/api/mailboxes/${encodeURIComponent(mailbox.publicId)}/${kind}`, "POST", {}, ticket.signal);
-      if (ticket.accept(result.password)) status(`${kind === "reset" ? "New" : "Mailbox"} password shown for ${mailbox.email}; it will clear in 60 seconds.`);
+      if (ticket.accept(result.password)) status(`${kind === "reset" ? "New" : "Mailbox"} password shown for ${mailbox.email}; it will clear in 5 minutes.`);
     } catch (error) { if (!ticket.signal.aborted) throw error; }
   };
   const actions = row.insertCell(); actions.className = "actions";
   actions.append(button("Reveal", () => requestPassword("reveal")), button("Copy", async () => { if (!await secret.copyTo((value) => navigator.clipboard.writeText(value))) return status("Reveal the password before copying."); status("Password copied."); }), button("Hide", () => secret.conceal()));
   actions.append(button("Reset", async () => { if (confirm(`Reset the password for ${mailbox.email}?`)) await requestPassword("reset"); }, true));
   actions.append(button("Delete", () => openDelete(mailbox, () => secret.conceal()), true));
-  row.addEventListener("focusout", (event: { relatedTarget: Node | null }) => { if (!row.contains(event.relatedTarget)) secret.conceal(); });
+  row.addEventListener("focusout", (event: { relatedTarget: Node | null }) => {
+    const target = event.relatedTarget as HTMLElement | null;
+    const targetRow = target?.closest?.("tr") ?? null;
+    if (targetRow !== null && targetRow !== row) secret.conceal();
+  });
 }
 
 function openDelete(mailbox: MailboxSummary, conceal: () => void): void {

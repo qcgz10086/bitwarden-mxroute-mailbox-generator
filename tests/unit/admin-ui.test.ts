@@ -155,7 +155,7 @@ describe("sensitive event workflows", () => {
     expect(current.accept("Resurrected123")).toBe(false);
   });
 
-  it("rejects a late response after navigation and clears accepted secrets on the fake 60-second timer", () => {
+  it("rejects a late response after navigation and clears accepted secrets on the conceal timer", () => {
     const node = { textContent: "" }; let connected = true; const timers: Array<() => void> = [];
     const controller = new SecretCellController(node, () => connected, (callback) => { timers.push(callback); return timers.length; }, () => undefined);
     const late = controller.begin(); connected = false;
