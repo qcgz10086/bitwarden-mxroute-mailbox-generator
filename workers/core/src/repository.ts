@@ -44,14 +44,25 @@ export interface ReservePendingMailboxInput {
   readonly now: string;
 }
 
+export interface RegisterMailboxInput {
+  readonly tokenId: string;
+  readonly date: string;
+  readonly publicId: string;
+  readonly email: string;
+  readonly localPart: string;
+  readonly domain: string;
+  readonly quotaMb: number;
+  readonly now: string;
+}
+
 export interface MailboxRecord {
   readonly publicId: string;
   readonly email: string;
   readonly localPart: string;
   readonly domain: string;
-  readonly passwordCiphertext: Uint8Array;
-  readonly passwordNonce: Uint8Array;
-  readonly encryptionKeyVersion: number;
+  readonly passwordCiphertext: Uint8Array | null;
+  readonly passwordNonce: Uint8Array | null;
+  readonly encryptionKeyVersion: number | null;
   readonly nextPasswordCiphertext: Uint8Array | null;
   readonly nextPasswordNonce: Uint8Array | null;
   readonly nextPasswordKeyVersion: number | null;
@@ -223,7 +234,9 @@ const MAILBOX_SORT_COLUMNS: Readonly<Record<MailboxSort, string>> = {
 };
 
 const ALLOWED_TRANSITIONS: Readonly<Record<MailboxStatus, readonly MailboxStatus[]>> = {
+  registered: ["activating", "deleting"],
   pending: ["active", "deleting"],
+  activating: ["active", "failed", "deleting"],
   active: ["resetting", "deleting"],
   failed: ["deleting"],
   resetting: ["active", "reset_unknown", "deleting"],
@@ -295,6 +308,64 @@ export class Repository {
     }
   }
 
+  async registerMailbox(input: RegisterMailboxInput): Promise<void> {
+    try {
+      await this.db.batch([
+        this.db.prepare(`INSERT INTO creation_counters(date, token_id, count) VALUES(?, ?, 1)
+          ON CONFLICT(date, token_id) DO UPDATE SET count = count + 1`)
+          .bind(input.date, input.tokenId),
+        this.db.prepare(`INSERT INTO mailboxes(
+            public_id,
+            email,
+            local_part,
+            domain,
+            quota_mb,
+            status,
+            created_at,
+            updated_at
+          ) VALUES(?, ?, ?, ?, ?, 'registered', ?, ?)`)
+          .bind(
+            input.publicId,
+            input.email,
+            input.localPart,
+            input.domain,
+            input.quotaMb,
+            input.now,
+            input.now,
+          ),
+      ]);
+    } catch (error) {
+      throw normalizeDatabaseError(error);
+    }
+  }
+
+  async beginMailboxActivation(publicId: string, password: EncryptedValue, quotaMb: number, now: string): Promise<void> {
+    try {
+      const result = await this.db.prepare(`UPDATE mailboxes
+        SET status = 'activating',
+            password_ciphertext = ?,
+            password_nonce = ?,
+            encryption_key_version = ?,
+            quota_mb = ?,
+            updated_at = ?
+        WHERE public_id = ? AND status = 'registered'`)
+        .bind(
+          toArrayBuffer(password.ciphertext),
+          toArrayBuffer(password.nonce),
+          password.keyVersion,
+          quotaMb,
+          now,
+          publicId,
+        )
+        .run();
+      if (Number(result.meta.changes ?? 0) !== 1) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+    } catch (error) {
+      throw normalizeDatabaseError(error);
+    }
+  }
+
   async transitionMailbox(
     publicId: string,
     from: MailboxStatus | readonly MailboxStatus[],
@@ -343,7 +414,7 @@ export class Repository {
             updated_at = ?,
             reservation_date = NULL,
             reservation_token_id = NULL
-        WHERE public_id = ? AND status = 'pending'`)
+        WHERE public_id = ? AND status IN ('pending', 'activating')`)
         .bind(updatedAt, publicId),
       auditStatement(this.db, event, true),
     ]);
@@ -379,7 +450,7 @@ export class Repository {
     await this.mutateWithAudit(this.db.prepare(`UPDATE mailboxes
       SET status = 'failed', failure_code = ?, updated_at = ?,
           reservation_date = NULL, reservation_token_id = NULL
-      WHERE public_id = ? AND status = 'pending'`).bind(failureCode, updatedAt, publicId), event);
+      WHERE public_id = ? AND status IN ('pending', 'activating')`).bind(failureCode, updatedAt, publicId), event);
   }
 
   async findRevealableMailbox(publicId: string): Promise<MailboxRecord | null> {
@@ -991,8 +1062,12 @@ function mapMailbox(row: MailboxRow): MailboxRecord {
     email: row.email,
     localPart: row.local_part,
     domain: row.domain,
-    passwordCiphertext: fromBlob(row.password_ciphertext),
-    passwordNonce: fromBlob(row.password_nonce),
+    passwordCiphertext: row.password_ciphertext === null
+      ? null
+      : fromBlob(row.password_ciphertext),
+    passwordNonce: row.password_nonce === null
+      ? null
+      : fromBlob(row.password_nonce),
     encryptionKeyVersion: row.encryption_key_version,
     nextPasswordCiphertext: row.next_password_ciphertext === null
       ? null

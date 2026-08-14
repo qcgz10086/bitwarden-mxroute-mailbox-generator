@@ -301,7 +301,7 @@ let auditCursor: string | null = null;
 let domains: readonly Domain[] = [];
 const clearMailboxSecrets = new Set<() => void>();
 function concealAllMailboxSecrets(): void { for (const clear of clearMailboxSecrets) clear(); }
-const recoveryStatuses: readonly MailboxStatus[] = ["pending", "resetting", "reset_unknown", "deleting", "delete_failed", "failed"];
+const recoveryStatuses: readonly MailboxStatus[] = ["activating", "pending", "resetting", "reset_unknown", "deleting", "delete_failed", "failed"];
 const recoveryPager = new RecoveryPager(async (state, cursor, signal) => {
   const params = new URLSearchParams({ limit: "100", status: state }); if (cursor) params.set("cursor", cursor);
   return api.get<MailboxPage>(`/api/mailboxes?${params}`, signal);
@@ -345,6 +345,15 @@ function renderMailbox(body: HTMLTableSectionElement, mailbox: MailboxSummary): 
   actions.append(button(t("btnReveal"), () => requestPassword("reveal")), button(t("btnCopy"), async () => { if (!await secret.copyTo((value) => navigator.clipboard.writeText(value))) return status(t("revealBeforeCopy")); status(t("passwordCopied")); }), button(t("btnHide"), () => secret.conceal()));
   actions.append(button(t("btnReset"), async () => { if (confirm(tf("confirmResetPassword", { email: mailbox.email }))) await requestPassword("reset"); }, true));
   actions.append(button(t("btnEditNote"), () => openNoteDialog(mailbox)));
+  if (mailbox.status === "registered") {
+    actions.append(button(t("btnConfirm"), async () => {
+      if (!confirm(tf("confirmMailboxPrompt", { email: mailbox.email }))) return;
+      await api.mutate(`/api/mailboxes/${encodeURIComponent(mailbox.publicId)}/confirm`, "POST");
+      status(t("mailboxConfirmed"));
+      await loadMailboxes();
+      await loadRecovery();
+    }));
+  }
   actions.append(button(t("btnDelete"), () => openDelete(mailbox, () => secret.conceal()), true));
   row.addEventListener("focusout", (event: { relatedTarget: Node | null }) => {
     const target = event.relatedTarget as HTMLElement | null;

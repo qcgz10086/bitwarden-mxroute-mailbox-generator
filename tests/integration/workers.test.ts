@@ -85,27 +85,34 @@ describe.sequential("three Worker integration", () => {
     ]);
   });
 
-  it("creates through Generator, keeps plaintext out of D1, and completes the Access plus CSRF Admin lifecycle", async () => {
+  it("registers through Generator, confirms to create the account, keeps plaintext out of D1, and completes the Access plus CSRF Admin lifecycle", async () => {
     const { rawToken } = await createToken("bitwarden-primary");
     const response = await generate(rawToken);
     expect(response.status).toBe(201);
     const alias = await response.json() as { email: string };
     expect(alias.email).toMatch(/^[23456789abcdefghjkmnpqrstuvwxyz]{12}@example\.com$/);
     expect(JSON.stringify(alias)).not.toContain("password");
-    const create = await lastWrite("POST");
-    expect(create?.body.quota, JSON.stringify(await mx.getWrites())).toBe(100);
-    expect(create?.body.password).toHaveLength(18);
-    const firstPassword = String(create?.body.password);
-    await expectNoPlaintext(firstPassword);
+    expect((await mx.getWrites()).filter((write) => write.method === "POST")).toHaveLength(0);
 
     const session = await adminRequest("/api/session");
     expect(session.status).toBe(200);
     const { csrfToken } = await session.json() as { csrfToken: string };
     const cookie = session.headers.get("set-cookie")!.split(";")[0]!;
     const list = await adminRequest("/api/mailboxes");
-    const page = await list.json() as { items: Array<{ publicId: string; email: string }> };
+    const page = await list.json() as { items: Array<{ publicId: string; email: string; status: string }> };
     expect(page.items.some((item) => item.email === alias.email)).toBe(true);
     const mailboxRow = page.items.find((item) => item.email === alias.email)!;
+    expect(mailboxRow.status).toBe("registered");
+
+    const confirm = await adminMutation(`/api/mailboxes/${mailboxRow.publicId}/confirm`, "POST", {}, csrfToken, cookie);
+    expect(confirm.status).toBe(200);
+    const create = await lastWrite("POST");
+    expect(create?.body.quota, JSON.stringify(await mx.getWrites())).toBe(100);
+    expect(create?.body.password).toHaveLength(18);
+    const firstPassword = String(create?.body.password);
+    await expectNoPlaintext(firstPassword);
+    expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(mailboxRow.publicId).first("status")).toBe("active");
+
     const reveal = await adminMutation(`/api/mailboxes/${mailboxRow.publicId}/reveal`, "POST", {}, csrfToken, cookie);
     expect(reveal.status).toBe(200);
     expect((await reveal.json() as { password: string }).password).toBe(firstPassword);
@@ -134,18 +141,24 @@ describe.sequential("three Worker integration", () => {
     expect(response.status).toBe(200);
   });
 
-  it("maps conflict, provider throttling, revoked credentials, and forged Access assertions without credential leakage", async () => {
+  it("maps conflict and throttling at confirm, revoked credentials, and forged Access assertions without credential leakage", async () => {
     const created = await createToken("failure-token");
-    for (const [failure, expected] of [["conflict", 503], ["rate", 503]] as const) {
+    for (const [failure, expected] of [["conflict", 409], ["rate", 503]] as const) {
       await setMxMode(failure);
-      const response = await generate(created.rawToken);
-      expect(response.status).toBe(expected);
-      const text = await response.text();
+      const generated = await generate(created.rawToken);
+      expect(generated.status).toBe(201);
+      const alias = await generated.json() as { email: string };
+      const row = await db.prepare("SELECT public_id FROM mailboxes WHERE email=?").bind(alias.email).first<{ public_id: string }>();
+      const session = await csrf();
+      const confirm = await adminMutation(`/api/mailboxes/${row!.public_id}/confirm`, "POST", {}, session.csrfToken, session.cookie);
+      expect(confirm.status).toBe(expected);
+      const text = await confirm.text();
       expect(text).not.toContain(created.rawToken);
       expect(text).not.toMatch(/["']password["']\s*:/i);
       const attemptedPassword = String((await lastWrite("POST"))?.body.password ?? "");
       expect(attemptedPassword).toHaveLength(18);
       expect(text).not.toContain(attemptedPassword);
+      await db.prepare("DELETE FROM mailboxes WHERE public_id=?").bind(row!.public_id).run();
     }
     await setMxMode("ok");
     const revokeCsrf = await csrf();
@@ -159,57 +172,61 @@ describe.sequential("three Worker integration", () => {
     expect(await response.json()).toEqual({ error: "UNAUTHORIZED" });
   });
 
-  it("recovers an upstream-created mailbox after the D1 activation transition fails and repeated cron runs remain idempotent", async () => {
+  it("recovers an upstream-created mailbox when confirm's activation transition fails, and repeated cron runs remain idempotent", async () => {
     const { rawToken } = await createToken("activation-failure");
+    const generated = await generate(rawToken);
+    expect(generated.status).toBe(201);
+    const alias = await generated.json() as { email: string };
+    const row = await db.prepare("SELECT public_id FROM mailboxes WHERE email=?").bind(alias.email).first<{ public_id: string }>();
     await db.prepare(`CREATE TRIGGER integration_fail_activation BEFORE UPDATE OF status ON mailboxes
       WHEN NEW.status='active' BEGIN SELECT RAISE(ABORT,'INJECTED_ACTIVATION_FAILURE'); END`).run();
-    const response = await generate(rawToken);
-    expect(response.status).toBe(503);
-    const responseText = await response.text();
+    const session = await csrf();
+    const confirm = await adminMutation(`/api/mailboxes/${row!.public_id}/confirm`, "POST", {}, session.csrfToken, session.cookie);
+    expect(confirm.status).toBe(500);
     const upstreamPassword = String((await lastWrite("POST"))?.body.password ?? "");
     expect(upstreamPassword).toHaveLength(18);
-    expect(responseText).not.toContain(upstreamPassword);
+    expect(await confirm.text()).not.toContain(upstreamPassword);
     await expectNoPlaintext(upstreamPassword);
     await db.prepare("DROP TRIGGER integration_fail_activation").run();
-    const pending = await db.prepare("SELECT public_id,email FROM mailboxes WHERE status='pending' ORDER BY id DESC LIMIT 1")
-      .first<{ public_id: string; email: string }>();
-    expect(pending).not.toBeNull();
-    await db.prepare("UPDATE mailboxes SET updated_at='2000-01-01T00:00:00.000Z' WHERE public_id=?").bind(pending!.public_id).run();
+    expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(row!.public_id).first("status")).toBe("activating");
+    await db.prepare("UPDATE mailboxes SET updated_at='2000-01-01T00:00:00.000Z' WHERE public_id=?").bind(row!.public_id).run();
     await core.scheduled({ cron: "*/5 * * * *", scheduledTime: new Date() });
     await core.scheduled({ cron: "*/5 * * * *", scheduledTime: new Date() });
-    expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(pending!.public_id).first("status")).toBe("active");
-    expect(await db.prepare("SELECT encryption_key_version FROM mailboxes WHERE public_id=?").bind(pending!.public_id).first("encryption_key_version")).toBe(1);
+    expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(row!.public_id).first("status")).toBe("active");
+    expect(await db.prepare("SELECT encryption_key_version FROM mailboxes WHERE public_id=?").bind(row!.public_id).first("encryption_key_version")).toBe(1);
     await assertRecoverablePasswords();
-    const { csrfToken, cookie } = await csrf();
-    const revealed = await adminMutation(`/api/mailboxes/${pending!.public_id}/reveal`, "POST", {}, csrfToken, cookie);
+    const revealed = await adminMutation(`/api/mailboxes/${row!.public_id}/reveal`, "POST", {}, session.csrfToken, session.cookie);
     expect(revealed.status).toBe(200);
     expect((await revealed.json() as { password: string }).password).toBe(upstreamPassword);
     await revokeTokenByRawName("activation-failure");
   });
 
-  it("preserves recoverable state across create, reset, and delete timeouts", async () => {
+  it("preserves recoverable state across confirm, reset, and delete timeouts", async () => {
     const { rawToken } = await createToken("timeout-token");
+    const generated = await generate(rawToken);
+    expect(generated.status).toBe(201);
+    const alias = await generated.json() as { email: string };
+    const row = await db.prepare("SELECT public_id,email FROM mailboxes WHERE email=?").bind(alias.email).first<{ public_id: string; email: string }>();
     await setMxMode("create-timeout");
-    const timedOut = await generate(rawToken);
+    const session = await csrf();
+    const timedOut = await adminMutation(`/api/mailboxes/${row!.public_id}/confirm`, "POST", {}, session.csrfToken, session.cookie);
     expect(timedOut.status).toBe(503);
     const createTimeoutBody = await timedOut.text();
     const createdPassword = String((await lastWrite("POST"))?.body.password ?? "");
     expect(createdPassword).toHaveLength(18);
     expect(createTimeoutBody).not.toContain(createdPassword);
-    expect(JSON.parse(createTimeoutBody)).toEqual({ error: "Mailbox service temporarily unavailable" });
+    expect(JSON.parse(createTimeoutBody)).toMatchObject({ error: "MX_TIMEOUT" });
     await expectNoPlaintext(createdPassword);
-    const pending = await db.prepare("SELECT public_id,email FROM mailboxes WHERE status='pending' ORDER BY id DESC LIMIT 1")
-      .first<{ public_id: string; email: string }>();
-    await db.prepare("UPDATE mailboxes SET updated_at='2000-01-01T00:00:00.000Z' WHERE public_id=?").bind(pending!.public_id).run();
+    expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(row!.public_id).first("status")).toBe("activating");
+    await db.prepare("UPDATE mailboxes SET updated_at='2000-01-01T00:00:00.000Z' WHERE public_id=?").bind(row!.public_id).run();
     await setMxMode("ok");
     await core.scheduled({ cron: "*/5 * * * *", scheduledTime: new Date() });
-    expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(pending!.public_id).first("status")).toBe("active");
+    expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(row!.public_id).first("status")).toBe("active");
 
-    const { csrfToken, cookie } = await csrf();
-    const oldReveal = await adminMutation(`/api/mailboxes/${pending!.public_id}/reveal`, "POST", {}, csrfToken, cookie);
+    const oldReveal = await adminMutation(`/api/mailboxes/${row!.public_id}/reveal`, "POST", {}, session.csrfToken, session.cookie);
     expect((await oldReveal.json() as { password: string }).password).toBe(createdPassword);
     await setMxMode("reset-timeout");
-    const reset = await adminMutation(`/api/mailboxes/${pending!.public_id}/reset`, "POST", {}, csrfToken, cookie);
+    const reset = await adminMutation(`/api/mailboxes/${row!.public_id}/reset`, "POST", {}, session.csrfToken, session.cookie);
     expect(reset.status).toBe(503);
     const resetBody = await reset.text();
     const candidatePassword = String((await lastWrite("PATCH"))?.body.password ?? "");
@@ -217,27 +234,27 @@ describe.sequential("three Worker integration", () => {
     expect(candidatePassword).not.toBe(createdPassword);
     expect(resetBody).not.toContain(candidatePassword);
     await expectNoPlaintext(candidatePassword);
-    expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(pending!.public_id).first("status")).toBe("reset_unknown");
+    expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(row!.public_id).first("status")).toBe("reset_unknown");
     expect(JSON.parse(resetBody)).toMatchObject({ error: "MX_TIMEOUT" });
     const resetUnknown = await db.prepare(`SELECT failure_code,encryption_key_version,next_password_key_version
-      FROM mailboxes WHERE public_id=?`).bind(pending!.public_id).first<{
+      FROM mailboxes WHERE public_id=?`).bind(row!.public_id).first<{
         failure_code: string; encryption_key_version: number; next_password_key_version: number;
       }>();
     expect(resetUnknown).toMatchObject({ failure_code: "MX_TIMEOUT", encryption_key_version: 1, next_password_key_version: 1 });
     await assertRecoverablePasswords();
-    await db.prepare("UPDATE mailboxes SET updated_at='2000-01-01T00:00:00.000Z',recovery_next_at=NULL WHERE public_id=?").bind(pending!.public_id).run();
+    await db.prepare("UPDATE mailboxes SET updated_at='2000-01-01T00:00:00.000Z',recovery_next_at=NULL WHERE public_id=?").bind(row!.public_id).run();
     await setMxMode("ok");
     await core.scheduled({ cron: "*/5 * * * *", scheduledTime: new Date() });
-    expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(pending!.public_id).first("status")).toBe("active");
-    const recoveredReveal = await adminMutation(`/api/mailboxes/${pending!.public_id}/reveal`, "POST", {}, csrfToken, cookie);
+    expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(row!.public_id).first("status")).toBe("active");
+    const recoveredReveal = await adminMutation(`/api/mailboxes/${row!.public_id}/reveal`, "POST", {}, session.csrfToken, session.cookie);
     expect((await recoveredReveal.json() as { password: string }).password).toBe(candidatePassword);
-    expect(await db.prepare("SELECT encryption_key_version FROM mailboxes WHERE public_id=?").bind(pending!.public_id).first("encryption_key_version")).toBe(1);
+    expect(await db.prepare("SELECT encryption_key_version FROM mailboxes WHERE public_id=?").bind(row!.public_id).first("encryption_key_version")).toBe(1);
 
     await setMxMode("delete-timeout");
-    const deleted = await adminMutation(`/api/mailboxes/${pending!.public_id}`, "DELETE", { confirmationEmail: pending!.email }, csrfToken, cookie);
+    const deleted = await adminMutation(`/api/mailboxes/${row!.public_id}`, "DELETE", { confirmationEmail: row!.email }, session.csrfToken, session.cookie);
     expect(deleted.status).toBe(200);
-    expect((await lastWrite("DELETE"))?.path).toContain(pending!.email.split("@")[0]!);
-    expect(await db.prepare("SELECT COUNT(*) count FROM mailboxes WHERE public_id=?").bind(pending!.public_id).first("count")).toBe(0);
+    expect((await lastWrite("DELETE"))?.path).toContain(row!.email.split("@")[0]!);
+    expect(await db.prepare("SELECT COUNT(*) count FROM mailboxes WHERE public_id=?").bind(row!.public_id).first("count")).toBe(0);
     await setMxMode("ok");
     await assertRecoverablePasswords();
   });

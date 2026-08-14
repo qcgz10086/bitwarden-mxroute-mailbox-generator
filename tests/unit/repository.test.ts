@@ -101,8 +101,8 @@ describe("D1 repository", () => {
       quotaMb: 100,
       encryptionKeyVersion: 1,
     });
-    expect(Array.from(mailbox!.passwordCiphertext)).toEqual([10, 20, 30, 40]);
-    expect(Array.from(mailbox!.passwordNonce)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    expect(Array.from(mailbox!.passwordCiphertext!)).toEqual([10, 20, 30, 40]);
+    expect(Array.from(mailbox!.passwordNonce!)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     expect(counter?.count).toBe(1);
   });
 
@@ -325,8 +325,8 @@ describe("D1 repository", () => {
     await repository.completePasswordReset("mbx_01", "2026-08-13T10:03:00.000Z");
     const completed = await repository.findMailbox("mbx_01");
     expect(completed?.status).toBe("active");
-    expect(Array.from(completed!.passwordCiphertext)).toEqual([50, 60, 70]);
-    expect(Array.from(completed!.passwordNonce)).toEqual([12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
+    expect(Array.from(completed!.passwordCiphertext!)).toEqual([50, 60, 70]);
+    expect(Array.from(completed!.passwordNonce!)).toEqual([12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
     expect(completed?.nextPasswordCiphertext).toBeNull();
     expect(completed?.nextPasswordNonce).toBeNull();
     expect(completed?.nextPasswordKeyVersion).toBeNull();

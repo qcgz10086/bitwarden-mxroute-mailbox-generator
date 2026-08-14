@@ -32,6 +32,7 @@ export interface AdminCore {
   resetPassword(identity: AdminIdentity, publicId: string): Promise<{ password: string; requestId: string }>;
   deleteMailbox(identity: AdminIdentity, publicId: string, confirmationEmail: string): Promise<{ requestId: string }>;
   setMailboxNote(identity: AdminIdentity, publicId: string, note: string | null): Promise<{ requestId: string }>;
+  confirmMailbox(identity: AdminIdentity, publicId: string): Promise<{ requestId: string }>;
   listDomains(identity: AdminIdentity): Promise<readonly DomainRecord[]>;
   syncDomains(identity: AdminIdentity): Promise<readonly DomainRecord[]>;
   setDefaultDomain(identity: AdminIdentity, domain: string): Promise<{ requestId: string }>;
@@ -115,6 +116,13 @@ async function route(request: Request, url: URL, method: string, identity: Admin
     const body = await readObject(request, new Set(["note"]));
     const note = requireNullableString(body, "note", 500);
     return json(await core.setMailboxNote(identity, decodeId(match[1]!), note));
+  }
+  match = path.match(/^\/api\/mailboxes\/([^/]+)\/confirm$/);
+  if (match) {
+    requireMethod(method, "POST");
+    rejectQuery(url, new Set());
+    await readObject(request, new Set());
+    return json(await core.confirmMailbox(identity, decodeId(match[1]!)));
   }
   match = path.match(/^\/api\/mailboxes\/([^/]+)$/);
   if (match) {

@@ -236,10 +236,10 @@ describe("MailboxService.generateMailbox", () => {
     expect((await repository.pageMailboxes()).items).toEqual([]);
   });
 
-  it("creates an encrypted 100 MB mailbox, activates it, audits it, and returns only alias fields", async () => {
+  it("registers a mailbox without creating credentials or calling MXroute, and returns only alias fields", async () => {
     const repository = new Repository(env.DB);
     await prepareActiveConfiguration(repository);
-    const mxroute = new FakeMxroute("success");
+    const mxroute = new FakeMxroute();
     const service = serviceWith(repository, mxroute);
 
     const result = await service.generateMailbox(TOKEN);
@@ -255,250 +255,50 @@ describe("MailboxService.generateMailbox", () => {
       },
       requestId: "request-01",
     });
-    expect(mxroute.requests).toEqual([{
-      domain: DOMAIN,
-      user: "23456789abcd",
-      password: PASSWORD,
-      quotaMb: 100,
-    }]);
+    expect(mxroute.requests).toEqual([]);
     const mailbox = await repository.findMailbox("mailbox-1");
     expect(mailbox).toMatchObject({
       email: `23456789abcd@${DOMAIN}`,
       quotaMb: 100,
-      status: "active",
+      status: "registered",
       failureCode: null,
-      encryptionKeyVersion: 1,
+      encryptionKeyVersion: null,
     });
-    expect(new TextDecoder().decode(mailbox!.passwordCiphertext)).not.toContain(PASSWORD);
-    await expect(decryptPassword({
-      encrypted: {
-        ciphertext: mailbox!.passwordCiphertext,
-        nonce: mailbox!.passwordNonce,
-        keyVersion: mailbox!.encryptionKeyVersion,
-      },
-      key: ENCRYPTION_KEY,
-      publicId: mailbox!.publicId,
-      email: mailbox!.email,
-    })).resolves.toBe(PASSWORD);
-    const audit = await env.DB.prepare("SELECT * FROM audit_events").first<Record<string, unknown>>();
-    expect(audit).toEqual({
-      id: "audit-01",
-      actor_type: "api_token",
-      actor_id: TOKEN_ID,
-      actor_email: null,
-      action: "mailbox.create",
-      email: `23456789abcd@${DOMAIN}`,
-      result: "success",
-      error_code: null,
-      request_id: "request-01",
-      created_at: NOW,
-    });
+    expect(mailbox?.passwordCiphertext).toBeNull();
+    expect(mailbox?.passwordNonce).toBeNull();
+    const counter = await env.DB.prepare(
+      "SELECT count FROM creation_counters WHERE date = ? AND token_id = ?",
+    ).bind("2026-08-13", TOKEN_ID).first<{ count: number }>();
+    expect(counter?.count).toBe(1);
   });
 
-  it("fails and releases every conflicted row while retrying five new prefixes", async () => {
+  it("retries a new prefix when the generated email already exists", async () => {
     const repository = new Repository(env.DB);
     await prepareActiveConfiguration(repository);
-    const prefixes = [
-      "23456789abc2",
-      "23456789abc3",
-      "23456789abc4",
-      "23456789abc5",
-      "23456789abc6",
-      "23456789abc7",
-    ];
-    const mxroute = new FakeMxroute(
-      "MX_CONFLICT",
-      "MX_CONFLICT",
-      "MX_CONFLICT",
-      "MX_CONFLICT",
-      "MX_CONFLICT",
-      "success",
-    );
+    const prefixes = ["23456789abc2", "23456789abc3"];
+    const mxroute = new FakeMxroute();
+    await env.DB.prepare(`INSERT INTO mailboxes(
+        public_id, email, local_part, domain, quota_mb, status, created_at, updated_at
+      ) VALUES(?, ?, ?, ?, 100, 'registered', ?, ?)`)
+      .bind("existing", `23456789abc2@${DOMAIN}`, "23456789abc2", DOMAIN, NOW, NOW).run();
 
     const result = await serviceWith(repository, mxroute, prefixes).generateMailbox(TOKEN);
 
-    expect(result.alias.email).toBe(`23456789abc7@${DOMAIN}`);
-    expect(mxroute.requests.map((request) => request.user)).toEqual(prefixes);
-    const rows = await env.DB.prepare(`SELECT email, status, failure_code
-      FROM mailboxes ORDER BY id`).all<Record<string, unknown>>();
-    expect(rows.results).toEqual([
-      ...prefixes.slice(0, 5).map((prefix) => ({
-        email: `${prefix}@${DOMAIN}`,
-        status: "failed",
-        failure_code: "MX_CONFLICT",
-      })),
-      { email: `${prefixes[5]}@${DOMAIN}`, status: "active", failure_code: null },
-    ]);
-    const counter = await env.DB.prepare(
-      "SELECT count FROM creation_counters WHERE date = ? AND token_id = ?",
-    ).bind("2026-08-13", TOKEN_ID).first<{ count: number }>();
-    expect(counter?.count).toBe(1);
-  });
-
-  it("stops after the initial conflict and five new-prefix conflicts", async () => {
-    const repository = new Repository(env.DB);
-    await prepareActiveConfiguration(repository);
-    const prefixes = [
-      "23456789abc2",
-      "23456789abc3",
-      "23456789abc4",
-      "23456789abc5",
-      "23456789abc6",
-      "23456789abc7",
-      "23456789abc8",
-    ];
-    const mxroute = new FakeMxroute(
-      "MX_CONFLICT",
-      "MX_CONFLICT",
-      "MX_CONFLICT",
-      "MX_CONFLICT",
-      "MX_CONFLICT",
-      "MX_CONFLICT",
-      "success",
-    );
-
-    await expect(serviceWith(repository, mxroute, prefixes).generateMailbox(TOKEN))
-      .rejects.toMatchObject({ code: "MX_CONFLICT", status: 503, retryable: true });
-    expect(mxroute.requests.map((request) => request.user)).toEqual(prefixes.slice(0, 6));
-    const rows = await env.DB.prepare("SELECT status, failure_code FROM mailboxes ORDER BY id")
-      .all<Record<string, unknown>>();
-    expect(rows.results).toEqual(Array.from({ length: 6 }, () => ({
-      status: "failed",
-      failure_code: "MX_CONFLICT",
-    })));
-    const counter = await env.DB.prepare(
-      "SELECT count FROM creation_counters WHERE date = ? AND token_id = ?",
-    ).bind("2026-08-13", TOKEN_ID).first<{ count: number }>();
-    expect(counter?.count).toBe(0);
-  });
-
-  it.each([
-    ["daily_creation_limit", "0", "DAILY_LIMIT"],
-    ["total_managed_limit", "0", "TOTAL_LIMIT"],
-  ] as const)("returns quota semantics for %s without calling MXroute", async (setting, value, code) => {
-    const repository = new Repository(env.DB);
-    await prepareActiveConfiguration(repository);
-    await env.DB.prepare("UPDATE settings SET value = ? WHERE key = ?").bind(value, setting).run();
-    const mxroute = new FakeMxroute();
-
-    await expect(serviceWith(repository, mxroute).generateMailbox(TOKEN)).rejects.toMatchObject({
-      code,
-      status: 429,
-      retryable: false,
-    });
+    expect(result.alias.email).toBe(`23456789abc3@${DOMAIN}`);
     expect(mxroute.requests).toEqual([]);
-    expect((await repository.pageMailboxes()).items).toEqual([]);
-  });
-
-  it.each([
-    ["MX_RATE_LIMITED", 503, true],
-    ["MX_UNAUTHORIZED", 502, false],
-    ["MX_NOT_FOUND", 502, false],
-  ] as const)("fails and releases pending state for explicit %s", async (code, status, retryable) => {
-    const repository = new Repository(env.DB);
-    await prepareActiveConfiguration(repository);
-    const mxroute = new FakeMxroute(code);
-
-    await expect(serviceWith(repository, mxroute).generateMailbox(TOKEN)).rejects.toMatchObject({
-      code,
-      status,
-      retryable,
-    });
-    expect(await repository.findMailbox("mailbox-1")).toMatchObject({
-      status: "failed",
-      failureCode: code,
-    });
-    const counter = await env.DB.prepare(
-      "SELECT count FROM creation_counters WHERE date = ? AND token_id = ?",
-    ).bind("2026-08-13", TOKEN_ID).first<{ count: number }>();
-    expect(counter?.count).toBe(0);
-  });
-
-  it.each([400, 403, 422])(
-    "fails and releases pending state for explicit HTTP %i client failure",
-    async () => {
-      const repository = new Repository(env.DB);
-      await prepareActiveConfiguration(repository);
-      const mxroute = new FakeMxroute("MX_CLIENT");
-
-      await expect(serviceWith(repository, mxroute).generateMailbox(TOKEN)).rejects.toMatchObject({
-        code: "MX_CLIENT",
-        status: 502,
-        retryable: false,
-      });
-      expect(await repository.findMailbox("mailbox-1")).toMatchObject({
-        status: "failed",
-        failureCode: "MX_CLIENT",
-      });
-      const counter = await env.DB.prepare(
-        "SELECT count FROM creation_counters WHERE date = ? AND token_id = ?",
-      ).bind("2026-08-13", TOKEN_ID).first<{ count: number }>();
-      expect(counter?.count).toBe(0);
-    },
-  );
-
-  it.each([
-    ["username", { username: "different", email: `23456789abcd@${DOMAIN}`, quotaMb: 100, limit: 9600 }],
-    ["email", { username: "23456789abcd", email: `different@${DOMAIN}`, quotaMb: 100, limit: 9600 }],
-    ["quota", { username: "23456789abcd", email: `23456789abcd@${DOMAIN}`, quotaMb: 250, limit: 9600 }],
-    ["limit", { username: "23456789abcd", email: `23456789abcd@${DOMAIN}`, quotaMb: 100, limit: 4800 }],
-  ] as const)("retains pending state when the create response mismatches %s", async (_field, response) => {
-    const repository = new Repository(env.DB);
-    await prepareActiveConfiguration(repository);
-    const mxroute = new FakeMxroute(response);
-
-    await expect(serviceWith(repository, mxroute).generateMailbox(TOKEN)).rejects.toMatchObject({
-      code: "MX_INVALID_RESPONSE",
-      status: 503,
-      retryable: true,
-    });
-    expect(await repository.findMailbox("mailbox-1")).toMatchObject({
-      status: "pending",
-      failureCode: null,
-    });
     const counter = await env.DB.prepare(
       "SELECT count FROM creation_counters WHERE date = ? AND token_id = ?",
     ).bind("2026-08-13", TOKEN_ID).first<{ count: number }>();
     expect(counter?.count).toBe(1);
   });
 
-  it.each([
-    "MX_SERVER",
-    "MX_TIMEOUT",
-    "MX_INVALID_RESPONSE",
-  ] as const)("retains encrypted pending state for uncertain %s", async (code) => {
-    const repository = new Repository(env.DB);
-    await prepareActiveConfiguration(repository);
-    const mxroute = new FakeMxroute(code);
-
-    const error = await generationError(serviceWith(repository, mxroute).generateMailbox(TOKEN));
-
-    expect(error).toMatchObject({ code, status: 503, retryable: true, requestId: "request-01" });
-    const mailbox = await repository.findMailbox("mailbox-1");
-    expect(mailbox).toMatchObject({ status: "pending", failureCode: null });
-    await expect(decryptPassword({
-      encrypted: {
-        ciphertext: mailbox!.passwordCiphertext,
-        nonce: mailbox!.passwordNonce,
-        keyVersion: mailbox!.encryptionKeyVersion,
-      },
-      key: ENCRYPTION_KEY,
-      publicId: mailbox!.publicId,
-      email: mailbox!.email,
-    })).resolves.toBe(PASSWORD);
-    const counter = await env.DB.prepare(
-      "SELECT count FROM creation_counters WHERE date = ? AND token_id = ?",
-    ).bind("2026-08-13", TOKEN_ID).first<{ count: number }>();
-    expect(counter?.count).toBe(1);
-  });
-
-  it("does not call MXroute when D1 rejects the pending reservation", async () => {
+  it("does not call MXroute when D1 rejects the registration", async () => {
     const repository = new Repository(env.DB);
     await prepareActiveConfiguration(repository);
     const mxroute = new FakeMxroute();
     const failingRepository = new Proxy(repository, {
       get(target, property, receiver) {
-        if (property === "reservePendingMailbox") {
+        if (property === "registerMailbox") {
           return async () => {
             throw new Error("injected D1 write failure");
           };
@@ -514,33 +314,5 @@ describe("MailboxService.generateMailbox", () => {
       retryable: false,
     });
     expect(mxroute.requests).toEqual([]);
-  });
-
-  it("retains pending state when D1 cannot record activation after upstream success", async () => {
-    const repository = new Repository(env.DB);
-    await prepareActiveConfiguration(repository);
-    const mxroute = new FakeMxroute("success");
-    const failingRepository = new Proxy(repository, {
-      get(target, property, receiver) {
-        if (property === "activateMailboxWithAudit") {
-          return async () => {
-            throw new Error("injected D1 transition failure");
-          };
-        }
-        const value = Reflect.get(target, property, receiver) as unknown;
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
-
-    await expect(serviceWith(failingRepository, mxroute).generateMailbox(TOKEN))
-      .rejects.toMatchObject({ code: "INTERNAL_ERROR", status: 503, retryable: true });
-    expect(await repository.findMailbox("mailbox-1")).toMatchObject({
-      status: "pending",
-      failureCode: null,
-    });
-    const counter = await env.DB.prepare(
-      "SELECT count FROM creation_counters WHERE date = ? AND token_id = ?",
-    ).bind("2026-08-13", TOKEN_ID).first<{ count: number }>();
-    expect(counter?.count).toBe(1);
   });
 });

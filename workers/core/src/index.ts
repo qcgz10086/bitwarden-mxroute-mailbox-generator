@@ -39,6 +39,7 @@ export class AdminEntrypoint extends WorkerEntrypoint<CoreEnv> {
   resetPassword(identity: AdminIdentity, publicId: string): Promise<{ password: string; requestId: string }> { return administration(this.env).resetPassword(identity, publicId); }
   deleteMailbox(identity: AdminIdentity, publicId: string, confirmationEmail: string): Promise<{ requestId: string }> { return administration(this.env).deleteMailbox(identity, publicId, confirmationEmail); }
   setMailboxNote(identity: AdminIdentity, publicId: string, note: string | null): Promise<{ requestId: string }> { return administration(this.env).setMailboxNote(identity, publicId, note); }
+  confirmMailbox(identity: AdminIdentity, publicId: string): Promise<{ requestId: string }> { return administration(this.env).confirmMailbox(identity, publicId); }
   syncDomains(identity: AdminIdentity): Promise<readonly DomainRecord[]> { return administration(this.env).syncDomains(identity); }
   setDefaultDomain(identity: AdminIdentity, domain: string): Promise<{ requestId: string }> { return administration(this.env).setDefaultDomain(identity, domain); }
   createApiToken(identity: AdminIdentity, name: string, operationId: string): Promise<{ id: string; rawToken: string; requestId: string; expiresAt: string }> { return administration(this.env).createApiToken(identity, name, operationId); }

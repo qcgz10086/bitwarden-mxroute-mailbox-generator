@@ -1,5 +1,7 @@
 export type MailboxStatus =
+  | "registered"
   | "pending"
+  | "activating"
   | "active"
   | "failed"
   | "resetting"

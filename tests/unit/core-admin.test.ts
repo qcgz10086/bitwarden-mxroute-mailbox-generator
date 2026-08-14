@@ -49,6 +49,16 @@ class FakeMxroute {
     if (outcome !== "success") throw new ServiceError(outcome);
   }
 
+  readonly creates: string[] = [];
+  createOutcomes: Outcome[] = [];
+
+  async createMailbox(domain: string, user: string, password: string, quotaMb: number): Promise<MxrouteMailbox> {
+    this.creates.push(`${user}@${domain}`);
+    const outcome = this.createOutcomes.shift() ?? "success";
+    if (outcome !== "success") throw new ServiceError(outcome);
+    return { username: user, email: `${user}@${domain}`, quotaMb, limit: 9600 };
+  }
+
   async getMailbox(domain: string, user: string): Promise<MxrouteMailbox> {
     this.gets.push(`${user}@${domain}`);
     const outcome = this.getOutcomes.shift() ?? "success";
@@ -107,6 +117,15 @@ async function seedMailbox(status: string = "active", updatedAt = STALE): Promis
       reservation_date, reservation_token_id
     ) VALUES(?, ?, 'alpha', ?, ?, ?, 1, 100, ?, ?, ?, NULL, NULL)`)
     .bind("mbx-1", EMAIL, DOMAIN, encrypted.ciphertext.buffer, encrypted.nonce.buffer, status, STALE, updatedAt)
+    .run();
+}
+
+async function seedRegisteredMailbox(publicId = "mbx-1", email = EMAIL, status = "registered", updatedAt = STALE): Promise<void> {
+  await new Repository(env.DB).syncDomains([DOMAIN], STALE);
+  await env.DB.prepare(`INSERT INTO mailboxes(
+      public_id, email, local_part, domain, quota_mb, status, created_at, updated_at
+    ) VALUES(?, ?, 'alpha', ?, 100, ?, ?, ?)`)
+    .bind(publicId, email, DOMAIN, status, STALE, updatedAt)
     .run();
 }
 
@@ -277,6 +296,64 @@ describe("AdministrationService password state machine", () => {
     await expectAdminError(service.setMailboxNote(ADMIN, "mbx-missing", "x"), "NOT_FOUND");
   });
 
+  it("confirms a registered mailbox by creating the account, storing an encrypted password, and auditing", async () => {
+    await seedRegisteredMailbox();
+    const mxroute = new FakeMxroute();
+    const service = adminService(mxroute);
+
+    const result = await service.confirmMailbox(ADMIN, "mbx-1");
+
+    expect(result).toMatchObject({ requestId: expect.any(String) });
+    expect(mxroute.creates).toEqual([`alpha@${DOMAIN}`]);
+    const mailbox = await new Repository(env.DB).findMailbox("mbx-1");
+    expect(mailbox).toMatchObject({ status: "active", failureCode: null });
+    expect(mailbox?.passwordCiphertext).not.toBeNull();
+    await expect(decryptPassword({
+      encrypted: {
+        ciphertext: mailbox!.passwordCiphertext!,
+        nonce: mailbox!.passwordNonce!,
+        keyVersion: mailbox!.encryptionKeyVersion!,
+      },
+      key: ENCRYPTION_KEY,
+      publicId: mailbox!.publicId,
+      email: mailbox!.email,
+    })).resolves.toMatch(/^[A-Za-z0-9!@#$%^&*()_+\-=\[\]{};:,.<>?~]{18}$/);
+    const audit = await env.DB.prepare("SELECT * FROM audit_events WHERE action = 'mailbox.confirm'").first<Record<string, unknown>>();
+    expect(audit).toMatchObject({ actor_type: "admin", action: "mailbox.confirm", email: EMAIL, result: "success" });
+    expect(JSON.stringify(audit)).not.toContain("password");
+  });
+
+  it("rejects confirming a mailbox that is not registered", async () => {
+    await seedMailbox();
+    const service = adminService();
+
+    await expectAdminError(service.confirmMailbox(ADMIN, "mbx-1"), "INVALID_STATE");
+  });
+
+  it.each(["MX_UNAUTHORIZED", "MX_CLIENT", "MX_CONFLICT"] as const)("marks an explicitly failed confirm as failed with %s", async (code) => {
+    await seedRegisteredMailbox();
+    const mxroute = new FakeMxroute();
+    mxroute.createOutcomes.push(code);
+    const service = adminService(mxroute);
+
+    await expectAdminError(service.confirmMailbox(ADMIN, "mbx-1"), code);
+    expect((await new Repository(env.DB).findMailbox("mbx-1"))?.status).toBe("failed");
+    const audit = await env.DB.prepare("SELECT result FROM audit_events WHERE action = 'mailbox.confirm'").first<{ result: string }>();
+    expect(audit?.result).toBe("failure");
+  });
+
+  it("keeps an uncertain confirm in activating state for reconciliation", async () => {
+    await seedRegisteredMailbox();
+    const mxroute = new FakeMxroute();
+    mxroute.createOutcomes.push("MX_TIMEOUT");
+    const service = adminService(mxroute);
+
+    await expectAdminError(service.confirmMailbox(ADMIN, "mbx-1"), "MX_TIMEOUT");
+    const mailbox = await new Repository(env.DB).findMailbox("mbx-1");
+    expect(mailbox?.status).toBe("activating");
+    expect(mailbox?.passwordCiphertext).not.toBeNull();
+  });
+
   it.each(["corrupt ciphertext", "missing key"])(
     "records one failure and no success for reveal with %s",
     async (failure) => {
@@ -350,7 +427,7 @@ describe("AdministrationService password state machine", () => {
     expect(mxroute.patches).toEqual([CANDIDATE, CANDIDATE]);
     const row = await new Repository(env.DB).findMailbox("mbx-1");
     expect(row?.status).toBe("active");
-    expect(await decryptPassword({ encrypted: { ciphertext: row!.passwordCiphertext, nonce: row!.passwordNonce, keyVersion: 1 }, key: ENCRYPTION_KEY, publicId: row!.publicId, email: row!.email })).toBe(CANDIDATE);
+    expect(await decryptPassword({ encrypted: { ciphertext: row!.passwordCiphertext!, nonce: row!.passwordNonce!, keyVersion: 1 }, key: ENCRYPTION_KEY, publicId: row!.publicId, email: row!.email })).toBe(CANDIDATE);
   });
 
   it("recovers a stale resetting row when promotion and reset_unknown persistence both fail", async () => {

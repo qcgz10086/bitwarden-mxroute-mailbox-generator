@@ -64,9 +64,7 @@ export class GenerationError extends Error {
 type GenerationRepository = Pick<Repository,
   | "verifyTokenDigest"
   | "getSettings"
-  | "reservePendingMailbox"
-  | "failPendingMailbox"
-  | "activateMailboxWithAudit"
+  | "registerMailbox"
 >;
 
 type GenerationMxroute = Pick<MxrouteClient, "createMailbox">;
@@ -136,31 +134,17 @@ export class MailboxService {
     const domain = settings.defaultDomain;
     for (let retry = 0; retry <= MAX_CONFLICT_RETRIES; retry += 1) {
       const localPart = this.generatePrefix(settings.prefixLength);
-      const password = this.generatePassword();
       const publicId = this.createId("mailbox");
       const email = `${localPart}@${domain}`;
-      let encrypted: EncryptedPassword;
-      try {
-        encrypted = await this.encrypt({
-          password,
-          key: this.dependencies.encryptionKey,
-          publicId,
-          email,
-          keyVersion: this.dependencies.encryptionKeyVersion,
-        });
-      } catch {
-        throw generationError("INTERNAL_ERROR", requestId);
-      }
 
       try {
-        await this.repository.reservePendingMailbox({
+        await this.repository.registerMailbox({
           tokenId: token.id,
           date: now.slice(0, 10),
           publicId,
           email,
           localPart,
           domain,
-          password: encrypted,
           quotaMb: settings.mailboxQuotaMb,
           now,
         });
@@ -169,54 +153,6 @@ export class MailboxService {
           continue;
         }
         throw normalizeBeforeUpstream(error, requestId);
-      }
-
-      try {
-        const created = await this.mxroute.createMailbox(
-          domain,
-          localPart,
-          password,
-          settings.mailboxQuotaMb,
-        );
-        if (
-          created.username !== localPart
-          || created.email !== email
-          || created.quotaMb !== settings.mailboxQuotaMb
-          || created.limit !== EXPECTED_MAILBOX_LIMIT
-        ) {
-          throw new ServiceError("MX_INVALID_RESPONSE");
-        }
-      } catch (error) {
-        if (isUncertainUpstreamFailure(error)) {
-          throw normalizeUpstream(error, requestId);
-        }
-
-        const serviceError = asServiceError(error);
-        if (serviceError !== null) {
-          await this.failExplicitAttempt(publicId, serviceError.code, now, requestId);
-          if (serviceError.code === "MX_CONFLICT" && retry < MAX_CONFLICT_RETRIES) {
-            continue;
-          }
-          throw normalizeUpstream(serviceError, requestId);
-        }
-
-        throw generationError("INTERNAL_ERROR", requestId, 503, true);
-      }
-
-      try {
-        await this.repository.activateMailboxWithAudit(publicId, now, {
-          id: this.createId("audit"),
-          actorType: "api_token",
-          actorId: token.id,
-          action: "mailbox.create",
-          email,
-          result: "success",
-          errorCode: null,
-          requestId,
-          createdAt: now,
-        });
-      } catch {
-        throw generationError("INTERNAL_ERROR", requestId, 503, true);
       }
 
       return {
@@ -233,19 +169,6 @@ export class MailboxService {
     }
 
     throw generationError("MX_CONFLICT", requestId, 503, true);
-  }
-
-  private async failExplicitAttempt(
-    publicId: string,
-    failureCode: ServiceErrorCode,
-    now: string,
-    requestId: string,
-  ): Promise<void> {
-    try {
-      await this.repository.failPendingMailbox(publicId, failureCode, now);
-    } catch {
-      throw generationError("INTERNAL_ERROR", requestId, 503, true);
-    }
   }
 }
 
@@ -272,7 +195,7 @@ export class AdminError extends Error {
 }
 
 type AdminMxroute = Pick<MxrouteClient,
-  "listDomains" | "getMailbox" | "updateMailbox" | "deleteMailbox"
+  "listDomains" | "getMailbox" | "updateMailbox" | "deleteMailbox" | "createMailbox"
 >;
 type AdminRepository = Repository;
 type AdminIdKind = "request" | "audit" | "token";
@@ -507,6 +430,71 @@ export class AdministrationService {
     }
   }
 
+  async confirmMailbox(identity: AdminIdentity, publicId: string): Promise<{ requestId: string }> {
+    const requestId = this.createId("request");
+    const now = this.now().toISOString();
+    const mailbox = await this.requireMailbox(publicId, requestId, identity, "mailbox.confirm");
+    if (mailbox.status !== "registered") {
+      await this.audit(identity, "mailbox.confirm", mailbox.email, "failure", "INVALID_STATE", requestId);
+      throw new AdminError("INVALID_STATE", requestId);
+    }
+    let password: string;
+    try {
+      password = this.generatePassword();
+      const key = this.dependencies.encryptionKeys[this.dependencies.encryptionKeyVersion];
+      if (key === undefined) throw new Error("missing encryption key");
+      const encrypted = await encryptPassword({
+        password, key, publicId: mailbox.publicId, email: mailbox.email,
+        keyVersion: this.dependencies.encryptionKeyVersion,
+      });
+      await this.dependencies.repository.beginMailboxActivation(publicId, encrypted, mailbox.quotaMb, now);
+    } catch (error) {
+      const code = repositoryAdminCode(error);
+      await this.audit(identity, "mailbox.confirm", mailbox.email, "failure", code, requestId);
+      throw new AdminError(code, requestId);
+    }
+    try {
+      const created = await this.dependencies.mxroute.createMailbox(
+        mailbox.domain,
+        mailbox.localPart,
+        password,
+        mailbox.quotaMb,
+      );
+      if (
+        created.username !== mailbox.localPart
+        || created.email !== mailbox.email
+        || created.quotaMb !== mailbox.quotaMb
+        || created.limit !== EXPECTED_MAILBOX_LIMIT
+      ) {
+        throw new ServiceError("MX_INVALID_RESPONSE");
+      }
+    } catch (error) {
+      if (isUncertainUpstreamFailure(error)) {
+        const code = asServiceError(error)?.code ?? "MX_TIMEOUT";
+        await this.audit(identity, "mailbox.confirm", mailbox.email, "failure", code, requestId);
+        throw new AdminError(code, requestId, true);
+      }
+      const serviceError = asServiceError(error);
+      const code = serviceError?.code ?? "INTERNAL_ERROR";
+      try {
+        await this.dependencies.repository.failPendingMailboxWithAudit(publicId, code, now,
+          this.adminEvent(identity, "mailbox.confirm", mailbox.email, "failure", code, requestId));
+      } catch {
+        // the record may already have moved; surface the upstream error below
+      }
+      throw new AdminError(code, requestId);
+    }
+    try {
+      await this.dependencies.repository.activateMailboxWithAudit(publicId, now,
+        this.adminEvent(identity, "mailbox.confirm", mailbox.email, "success", null, requestId));
+    } catch (error) {
+      const code = repositoryAdminCode(error);
+      await this.audit(identity, "mailbox.confirm", mailbox.email, "failure", code, requestId);
+      throw new AdminError(code, requestId);
+    }
+    return { requestId };
+  }
+
   async updateSettings(identity: AdminIdentity, patch: AdminSettingsPatch): Promise<{ requestId: string }> {
     return this.adminMutation(identity, "settings.update", null, async (event) => {
       validateSettings(patch);
@@ -597,17 +585,17 @@ export class AdministrationService {
       await this.dependencies.repository.expirePendingTokenWithAudit(id, now, now,
         this.systemAudit("token.create.expire", null, "success", null, now));
     }
-    return expired.length + await this.reconcile(["pending", "reset_unknown", "resetting", "deleting"]);
+    return expired.length + await this.reconcile(["pending", "activating", "reset_unknown", "resetting", "deleting"]);
   }
 
-  private async reconcile(statuses: readonly ("pending" | "reset_unknown" | "resetting" | "deleting")[]): Promise<number> {
+  private async reconcile(statuses: readonly ("pending" | "activating" | "reset_unknown" | "resetting" | "deleting")[]): Promise<number> {
     const nowDate = this.now();
     const now = nowDate.toISOString();
     const staleBefore = new Date(nowDate.getTime() - 5 * 60_000).toISOString();
     const rows = await this.dependencies.repository.listRecoveryCandidates(statuses, staleBefore, now, 25);
     for (const mailbox of rows) {
       try {
-        if (mailbox.status === "pending") {
+        if (mailbox.status === "pending" || mailbox.status === "activating") {
           const existence = await this.checkExistence(mailbox);
           if (existence === true) {
             await this.dependencies.repository.activateMailboxWithAudit(mailbox.publicId, now, this.systemAudit("mailbox.create.reconcile", mailbox.email, "success", null, now));

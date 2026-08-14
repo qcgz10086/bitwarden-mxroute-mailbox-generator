@@ -58,6 +58,7 @@ function coreDouble() {
     resetPassword: vi.fn(async () => ({ password: "NewSecret123", requestId: "r2" })),
     deleteMailbox: vi.fn(async () => ({ requestId: "r3" })),
     setMailboxNote: vi.fn(async () => ({ requestId: "r8" })),
+    confirmMailbox: vi.fn(async () => ({ requestId: "r9" })),
     listDomains: vi.fn(async () => []), syncDomains: vi.fn(async () => []),
     setDefaultDomain: vi.fn(async () => ({ requestId: "r4" })),
     getSettings: vi.fn(async () => ({ defaultDomain: null, mailboxQuotaMb: 100, prefixLength: 12, dailyCreationLimit: 30, totalManagedLimit: 500, generationEnabled: true })),
@@ -145,6 +146,7 @@ describe("Admin worker", () => {
       ["/api/mailboxes/m1/reveal","POST",{},s.CORE.revealPassword], ["/api/mailboxes/m1/reset","POST",{},s.CORE.resetPassword], ["/api/mailboxes/m1","DELETE",{ confirmationEmail:" a@example.com " },s.CORE.deleteMailbox],
       ["/api/domains/sync","POST",{},s.CORE.syncDomains], ["/api/domains/default","PUT",{ domain:"example.com" },s.CORE.setDefaultDomain], ["/api/settings","PUT",{ mailboxQuotaMb:100 },s.CORE.updateSettings],
       ["/api/mailboxes/m1/note","PUT",{ note:" keepalive " },s.CORE.setMailboxNote],
+      ["/api/mailboxes/m1/confirm","POST",{},s.CORE.confirmMailbox],
       ["/api/tokens","POST",{ name:"phone", operationId:"operation-phone-0001" },s.CORE.createApiToken], ["/api/tokens/t1","DELETE",{},s.CORE.revokeApiToken],
       ["/api/tokens/t1/acknowledge","POST",{ operationId:"operation-phone-0001" },s.CORE.acknowledgeApiToken],
     ];
@@ -153,6 +155,7 @@ describe("Admin worker", () => {
     expect(s.CORE.revealPassword).toHaveBeenCalledWith(id,"m1");
     expect(s.CORE.resetPassword).toHaveBeenCalledWith(id,"m1");
     expect(s.CORE.setMailboxNote).toHaveBeenCalledWith(id,"m1","keepalive");
+    expect(s.CORE.confirmMailbox).toHaveBeenCalledWith(id,"m1");
     expect(s.CORE.syncDomains).toHaveBeenCalledWith(id);
     expect(s.CORE.setDefaultDomain).toHaveBeenCalledWith(id,"example.com");
     expect(s.CORE.updateSettings).toHaveBeenCalledWith(id,{ mailboxQuotaMb:100 });

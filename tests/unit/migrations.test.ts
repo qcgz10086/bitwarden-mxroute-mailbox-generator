@@ -6,7 +6,7 @@ type TestEnv = Env & { TEST_MIGRATIONS: D1Migration[] };
 describe("Core D1 migrations", () => {
   it("upgrades a database where 0001 is already recorded", async () => {
     const migrations = (env as TestEnv).TEST_MIGRATIONS;
-    expect(migrations).toHaveLength(5);
+    expect(migrations).toHaveLength(6);
     await applyD1Migrations(env.DB, [migrations[0]!]);
     const before = await env.DB.prepare("PRAGMA table_info(mailboxes)").all<{ name: string }>();
     expect(before.results.map((column) => column.name)).not.toContain("recovery_attempt_count");
