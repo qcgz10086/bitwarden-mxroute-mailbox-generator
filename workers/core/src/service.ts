@@ -6,7 +6,9 @@ import type {
 import {
   decryptPassword,
   encryptPassword,
+  hashAdminPassword,
   tokenHmac,
+  verifyAdminPassword as verifyPasswordHash,
   type EncryptPasswordInput,
   type EncryptedPassword,
 } from "../../../packages/security/src/crypto";
@@ -493,6 +495,33 @@ export class AdministrationService {
       throw new AdminError(code, requestId);
     }
     return { requestId };
+  }
+
+  async isAdminPasswordSet(): Promise<boolean> {
+    return (await this.dependencies.repository.getAdminPasswordHash()) !== null;
+  }
+
+  async verifyAdminPassword(password: string): Promise<boolean> {
+    const stored = await this.dependencies.repository.getAdminPasswordHash();
+    return stored !== null && verifyPasswordHash(password, stored);
+  }
+
+  async setAdminPassword(identity: AdminIdentity, newPassword: string): Promise<{ requestId: string }> {
+    const requestId = this.createId("request");
+    if (newPassword.length < 8 || newPassword.length > 128) {
+      await this.audit(identity, "admin.password", null, "failure", "INVALID_INPUT", requestId);
+      throw new AdminError("INVALID_INPUT", requestId);
+    }
+    try {
+      const hash = await hashAdminPassword(newPassword);
+      await this.dependencies.repository.setAdminPasswordHashWithAudit(hash,
+        this.adminEvent(identity, "admin.password", null, "success", null, requestId));
+      return { requestId };
+    } catch (error) {
+      const code = repositoryAdminCode(error);
+      await this.audit(identity, "admin.password", null, "failure", code, requestId);
+      throw new AdminError(code, requestId);
+    }
   }
 
   async updateSettings(identity: AdminIdentity, patch: AdminSettingsPatch): Promise<{ requestId: string }> {

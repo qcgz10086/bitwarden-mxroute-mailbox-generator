@@ -43,6 +43,9 @@ export interface AdminCore {
   acknowledgeApiToken(identity: AdminIdentity, id: string, operationId: string): Promise<{ requestId: string }>;
   revokeApiToken(identity: AdminIdentity, id: string): Promise<{ requestId: string }>;
   pageAudit(identity: AdminIdentity, options: PageAuditOptions): Promise<AuditPage>;
+  isAdminPasswordSet(): Promise<boolean>;
+  verifyAdminPassword(password: string): Promise<boolean>;
+  setAdminPassword(identity: AdminIdentity, newPassword: string): Promise<{ requestId: string }>;
 }
 export interface AdminEnv {
   readonly CORE: AdminCore;
@@ -51,6 +54,9 @@ export interface AdminEnv {
   readonly ACCESS_AUD: string;
   readonly ADMIN_EMAILS: string;
   readonly ADMIN_ORIGIN: string;
+  readonly TURNSTILE_SITE_KEY?: string;
+  readonly TURNSTILE_SECRET_KEY?: string;
+  readonly ADMIN_SESSION_KEY?: string;
 }
 
 class HttpError extends Error {
@@ -69,10 +75,70 @@ export function createAdminHandler(dependencies: { jwks?: JWTVerifyGetKey } = {}
           adminEmails: env.ADMIN_EMAILS,
         }, dependencies.jwks);
         const url = new URL(request.url);
-        if (url.pathname !== "/api" && !url.pathname.startsWith("/api/")) {
+        const isApi = url.pathname === "/api" || url.pathname.startsWith("/api/");
+        const isAuthPath = url.pathname.startsWith("/api/auth/");
+        const sessionEnabled = typeof env.ADMIN_SESSION_KEY === "string" && env.ADMIN_SESSION_KEY.length > 0;
+
+        if (sessionEnabled && !isAuthPath) {
+          const authenticated = await adminSessionValid(request, env.ADMIN_SESSION_KEY!);
+          if (!authenticated) {
+            if (isApi) {
+              return secure(json({ error: "ADMIN_LOGIN_REQUIRED" }, 401));
+            }
+            const path = url.pathname;
+            if (path !== "/" && path !== "/login" && path !== "/login.html" && !path.startsWith("/assets/")) {
+              return secure(await env.ASSETS.fetch(request));
+            }
+            return secure(await env.ASSETS.fetch(new Request("https://admin/login.html", request)));
+          }
+        }
+
+        if (!isApi) {
           return secure(await env.ASSETS.fetch(request));
         }
         const method = request.method.toUpperCase();
+        if (url.pathname === "/api/auth/status") {
+          requireMethod(method, "GET");
+          return json({
+            enabled: sessionEnabled,
+            authenticated: sessionEnabled ? await adminSessionValid(request, env.ADMIN_SESSION_KEY!) : true,
+            passwordSet: await env.CORE.isAdminPasswordSet(),
+            siteKey: env.TURNSTILE_SITE_KEY ?? null,
+          }, 200);
+        }
+        if (url.pathname === "/api/auth/login") {
+          requireMethod(method, "POST");
+          rejectQuery(url, new Set());
+          requireSameOrigin(request, env.ADMIN_ORIGIN);
+          const body = await readObject(request, new Set(["password", "turnstileToken"]));
+          const password = requireString(body, "password", 128);
+          const turnstileToken = typeof body.turnstileToken === "string" ? body.turnstileToken : "";
+          if (env.TURNSTILE_SECRET_KEY !== undefined && !(await verifyTurnstile(env.TURNSTILE_SECRET_KEY, turnstileToken, request))) {
+            throw new HttpError(400, "INVALID_TURNSTILE");
+          }
+          if (!(await env.CORE.verifyAdminPassword(password))) {
+            throw new HttpError(401, "INVALID_PASSWORD");
+          }
+          return json({ ok: true }, 200, { "Set-Cookie": await issueAdminSession(env.ADMIN_SESSION_KEY!) });
+        }
+        if (url.pathname === "/api/auth/reset") {
+          requireMethod(method, "POST");
+          rejectQuery(url, new Set());
+          requireSameOrigin(request, env.ADMIN_ORIGIN);
+          const body = await readObject(request, new Set(["newPassword", "turnstileToken"]));
+          const newPassword = requireString(body, "newPassword", 128);
+          const turnstileToken = typeof body.turnstileToken === "string" ? body.turnstileToken : "";
+          if (env.TURNSTILE_SECRET_KEY !== undefined && !(await verifyTurnstile(env.TURNSTILE_SECRET_KEY, turnstileToken, request))) {
+            throw new HttpError(400, "INVALID_TURNSTILE");
+          }
+          await env.CORE.setAdminPassword(identity, newPassword);
+          return json({ ok: true }, 200, { "Set-Cookie": await issueAdminSession(env.ADMIN_SESSION_KEY!) });
+        }
+        if (url.pathname === "/api/auth/logout") {
+          requireMethod(method, "POST");
+          rejectQuery(url, new Set());
+          return json({ ok: true }, 200, { "Set-Cookie": "admin_session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict" });
+        }
         if (["POST", "PUT", "DELETE"].includes(method) && !validateCsrf(request, env.ADMIN_ORIGIN)) {
           throw new HttpError(403, "FORBIDDEN");
         }
@@ -320,6 +386,11 @@ function requireMethod(actual: string, expected: string): void {
   if (actual !== expected) throw new HttpError(405, "METHOD_NOT_ALLOWED");
 }
 
+function requireSameOrigin(request: Request, origin: string): void {
+  const header = request.headers.get("Origin");
+  if (header !== origin) throw new HttpError(403, "FORBIDDEN");
+}
+
 function json(value: unknown, status = 200, headers: HeadersInit = {}): Response {
   return new Response(JSON.stringify(value), {
     status, headers: { "Content-Type": "application/json; charset=utf-8", ...headers },
@@ -371,6 +442,73 @@ function normalizeCoreError(error: unknown): {
     return { status: 500, body: { error: "INTERNAL_ERROR" } };
   }
   return { status, body: { error: code, requestId, retryable: candidate.retryable } };
+}
+
+function toBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function hmacKey(key: string, message: string): Promise<Uint8Array> {
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(key),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const digest = await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(message));
+  return new Uint8Array(digest).slice(0, 16);
+}
+
+function cookieValue(cookieHeader: string | null, name: string): string | null {
+  if (cookieHeader === null) return null;
+  for (const part of cookieHeader.split(";")) {
+    const [key, ...rest] = part.trim().split("=");
+    if (key === name) return rest.join("=");
+  }
+  return null;
+}
+
+async function adminSessionValid(request: Request, key: string): Promise<boolean> {
+  const cookie = cookieValue(request.headers.get("Cookie"), "admin_session");
+  if (cookie === null) return false;
+  const dot = cookie.indexOf(".");
+  if (dot <= 0) return false;
+  const expiry = Number(cookie.slice(0, dot));
+  const signature = cookie.slice(dot + 1);
+  if (!Number.isFinite(expiry) || expiry <= Math.floor(Date.now() / 1_000)) return false;
+  const expected = toBase64Url(await hmacKey(key, String(expiry)));
+  if (signature.length !== expected.length) return false;
+  let difference = 0;
+  for (let index = 0; index < signature.length; index += 1) {
+    difference |= signature.charCodeAt(index) ^ expected.charCodeAt(index);
+  }
+  return difference === 0;
+}
+
+async function issueAdminSession(key: string): Promise<string> {
+  const expiry = Math.floor(Date.now() / 1_000) + 12 * 3_600;
+  const signature = toBase64Url(await hmacKey(key, String(expiry)));
+  return `admin_session=${expiry}.${signature}; Max-Age=${12 * 3_600}; Path=/; HttpOnly; Secure; SameSite=Strict`;
+}
+
+async function verifyTurnstile(secret: string, token: string, request: Request): Promise<boolean> {
+  if (token.length === 0 || token.length > 4_096) return false;
+  const body = new FormData();
+  body.set("secret", secret);
+  body.set("response", token);
+  const remote = request.headers.get("CF-Connecting-IP");
+  if (remote !== null) body.set("remoteip", remote);
+  try {
+    const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", { method: "POST", body });
+    if (!response.ok) return false;
+    const data = await response.json() as { success?: unknown };
+    return data.success === true;
+  } catch {
+    return false;
+  }
 }
 
 export default createAdminHandler();

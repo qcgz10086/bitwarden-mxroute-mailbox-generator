@@ -776,6 +776,16 @@ export class Repository {
     };
   }
 
+  async getAdminPasswordHash(): Promise<string | null> {
+    const row = await this.db.prepare("SELECT value FROM settings WHERE key = 'admin_password_hash'").first<{ value: string }>();
+    return row?.value ?? null;
+  }
+
+  async setAdminPasswordHashWithAudit(hash: string, event: AuditEventInput): Promise<void> {
+    await this.mutateWithAudit(this.db.prepare(`INSERT INTO settings(key, value) VALUES('admin_password_hash', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(hash), event);
+  }
+
   async updateSettings(patch: SettingsPatch): Promise<void> {
     const values: readonly [keyof SettingsPatch, string, string][] = [
       ["mailboxQuotaMb", "mailbox_quota_mb", String(patch.mailboxQuotaMb)],

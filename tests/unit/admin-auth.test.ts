@@ -67,13 +67,16 @@ function coreDouble() {
     acknowledgeApiToken: vi.fn(async () => ({ requestId: "r7" })),
     revokeApiToken: vi.fn(async () => ({ requestId: "r7" })),
     pageAudit: vi.fn(async () => ({ items: [], nextCursor: null })),
+    isAdminPasswordSet: vi.fn(async () => false),
+    verifyAdminPassword: vi.fn(async () => false),
+    setAdminPassword: vi.fn(async () => ({ requestId: "r10" })),
   };
 }
 
-function setup() {
+function setup(overrides: Record<string, unknown> = {}) {
   const CORE = coreDouble();
   const ASSETS = { fetch: vi.fn(async () => new Response("asset", { headers: { "Content-Type": "text/html" } })) };
-  const env = { CORE, ASSETS, ACCESS_TEAM_DOMAIN: "https://team.cloudflareaccess.com", ACCESS_AUD: "admin-aud", ADMIN_EMAILS: "admin@example.com", ADMIN_ORIGIN: ORIGIN } as unknown as AdminEnv;
+  const env = { CORE, ASSETS, ACCESS_TEAM_DOMAIN: "https://team.cloudflareaccess.com", ACCESS_AUD: "admin-aud", ADMIN_EMAILS: "admin@example.com", ADMIN_ORIGIN: ORIGIN, ...overrides } as unknown as AdminEnv;
   const handler = createAdminHandler({ jwks: createLocalJWKSet(fixture.jwks) });
   return { CORE, ASSETS, fetch: (request: Request) => handler.fetch(request, env) };
 }
@@ -161,6 +164,40 @@ describe("Admin worker", () => {
     expect(s.CORE.updateSettings).toHaveBeenCalledWith(id,{ mailboxQuotaMb:100 });
     expect(s.CORE.createApiToken).toHaveBeenCalledWith(id,"phone","operation-phone-0001");
     expect(s.CORE.revokeApiToken).toHaveBeenCalledWith(id,"t1");
+  });
+
+  it("gates the API behind a password session and issues one on valid login", async () => {
+    const s = setup({ ADMIN_SESSION_KEY: "session-secret-123" });
+    s.CORE.verifyAdminPassword.mockResolvedValue(true);
+
+    const blocked = await s.fetch(authRequest("/api/mailboxes"));
+    expect(blocked.status).toBe(401);
+    expect(await blocked.json()).toEqual({ error: "ADMIN_LOGIN_REQUIRED" });
+
+    const login = await s.fetch(authRequest("/api/auth/login", { method: "POST", headers: { Origin: ORIGIN, "Content-Type": "application/json" }, body: JSON.stringify({ password: "password123" }) }));
+    expect(login.status).toBe(200);
+    const cookie = login.headers.get("set-cookie")!.split(";")[0]!;
+    expect(cookie).toMatch(/^admin_session=/);
+
+    const ok = await s.fetch(authRequest("/api/mailboxes", { headers: { Cookie: cookie } }));
+    expect(ok.status).toBe(200);
+    expect(s.CORE.verifyAdminPassword).toHaveBeenCalledWith("password123");
+  });
+
+  it("rejects login when Turnstile is configured but the token fails", async () => {
+    const s = setup({ ADMIN_SESSION_KEY: "session-secret-123", TURNSTILE_SECRET_KEY: "turnstile-secret" });
+    const response = await s.fetch(authRequest("/api/auth/login", { method: "POST", headers: { Origin: ORIGIN, "Content-Type": "application/json" }, body: JSON.stringify({ password: "password123", turnstileToken: "stale-token" }) }));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "INVALID_TURNSTILE" });
+    expect(s.CORE.verifyAdminPassword).not.toHaveBeenCalled();
+  });
+
+  it("resets the admin password through the Access-verified flow and issues a session", async () => {
+    const s = setup({ ADMIN_SESSION_KEY: "session-secret-123" });
+    const response = await s.fetch(authRequest("/api/auth/reset", { method: "POST", headers: { Origin: ORIGIN, "Content-Type": "application/json" }, body: JSON.stringify({ newPassword: "NewPass123!" }) }));
+    expect(response.status).toBe(200);
+    expect(s.CORE.setAdminPassword).toHaveBeenCalledWith({ subject: "access-user", email: "admin@example.com" }, "NewPass123!");
+    expect(response.headers.get("set-cookie")).toMatch(/admin_session=/);
   });
   it("rejects missing confirmations, unexpected/invalid values, oversized bodies, methods and paths", async () => {
     const s = setup();

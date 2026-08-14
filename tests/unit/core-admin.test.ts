@@ -296,6 +296,18 @@ describe("AdministrationService password state machine", () => {
     await expectAdminError(service.setMailboxNote(ADMIN, "mbx-missing", "x"), "NOT_FOUND");
   });
 
+  it("sets, verifies, and rejects the admin password", async () => {
+    const service = adminService();
+    expect(await service.isAdminPasswordSet()).toBe(false);
+    await service.setAdminPassword(ADMIN, "CorrectHorse123");
+    expect(await service.isAdminPasswordSet()).toBe(true);
+    expect(await service.verifyAdminPassword("CorrectHorse123")).toBe(true);
+    expect(await service.verifyAdminPassword("WrongPassword")).toBe(false);
+    await expectAdminError(service.setAdminPassword(ADMIN, "short"), "INVALID_INPUT");
+    const audit = await env.DB.prepare("SELECT result FROM audit_events WHERE action = 'admin.password'").first<{ result: string }>();
+    expect(audit?.result).toBe("success");
+  });
+
   it("confirms a registered mailbox by creating the account, storing an encrypted password, and auditing", async () => {
     await seedRegisteredMailbox();
     const mxroute = new FakeMxroute();
