@@ -80,7 +80,7 @@ export class SecretCellController {
   constructor(
     private readonly node: TextTarget,
     private readonly isCurrent: () => boolean,
-    private readonly setTimer: (callback: () => void, milliseconds: number) => unknown = setTimeout,
+    private readonly setTimer: (callback: () => void, milliseconds: number) => unknown = (callback, ms) => setTimeout(callback, ms),
     private readonly clearTimer: (timer: unknown) => void = (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
   ) { this.mask(); }
   begin(): SecretTicket {
