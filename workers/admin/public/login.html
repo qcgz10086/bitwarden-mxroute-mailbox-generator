@@ -1,93 +1,14 @@
-<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>邮箱管理后台 · 登录</title><style>
-:root{color-scheme:dark;--bg:#08111f;--panel:#111d2f;--line:#2b3b52;--text:#edf4ff;--muted:#9fb0c5;--accent:#57c7ff;--danger:#ff6b7b;font:16px/1.5 system-ui,sans-serif}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--text)}
-main{width:min(26rem,calc(100% - 2rem));background:var(--panel);border:1px solid var(--line);border-radius:1rem;padding:2rem}
-h1{font-size:1.3rem;margin:0 0 .5rem}p.hint{color:var(--muted);margin:.25rem 0 1.25rem}
-label{display:grid;gap:.35rem;color:var(--muted);margin-bottom:1rem}
-input,button{font:inherit;border-radius:.5rem;border:1px solid var(--line);padding:.65rem .8rem;background:#0b1728;color:var(--text)}
-button{cursor:pointer;background:#173558;margin-top:.25rem}button:hover{border-color:var(--accent)}
-.error{color:var(--danger);min-height:1.5em;margin:.5rem 0 0}.toggle{position:absolute;top:1rem;right:1rem}
-.mode{display:flex;gap:.6rem;align-items:center;margin-top:1rem}
-.mode button{background:none;border:none;color:var(--accent);padding:0;text-decoration:underline}
-</style><script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body>
-<button id="lang" class="toggle">EN</button>
+<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>邮箱管理后台 · 登录</title><link rel="stylesheet" href="/login.css"><script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body>
 <main>
+  <button id="lang" class="toggle" type="button">EN</button>
   <h1 id="title">邮箱管理后台</h1>
-  <p class="hint" id="subtitle">密码登录</p>
+  <p class="hint" id="subtitle">设置后台密码</p>
   <form id="auth-form">
-    <label id="pwd-label" for="pwd">密码<input id="pwd" type="password" autocomplete="current-password" maxlength="128" required></label>
-    <label id="npwd-label" for="pwd" hidden>新密码<input id="pwd" type="password" autocomplete="new-password" maxlength="128" required></label>
-    <button id="submit" type="submit">登录</button>
+    <label id="pwd-label" for="pwd"><span id="pwd-label-text">新密码</span><input id="pwd" type="password" maxlength="128" required autocomplete="new-password"></label>
+    <button id="submit" type="submit">设置并进入</button>
   </form>
-  <div class="mode"><span id="mode-text">忘记密码？</span><button id="mode-toggle" type="button">使用现有登录方式重置密码</button></div>
-  <p class="error" id="error"></p>
+  <div class="mode" id="mode-row"><span id="mode-text"></span><button id="mode-toggle" type="button"></button></div>
+  <p class="error" id="error" aria-live="polite"></p>
 </main>
-<script>
-(function () {
-  var statusEl = document.getElementById("error");
-  var title = document.getElementById("title"), subtitle = document.getElementById("subtitle");
-  var pwdLabel = document.getElementById("pwd-label"), npwdLabel = document.getElementById("npwd-label");
-  var submit = document.getElementById("submit"), pwd = document.getElementById("pwd");
-  var modeText = document.getElementById("mode-text"), modeToggle = document.getElementById("mode-toggle");
-  var langBtn = document.getElementById("lang");
-  var form = document.getElementById("auth-form");
-  var I18N = {
-    zh: { title: "邮箱管理后台", login: "密码登录", set: "设置后台密码", pwd: "密码", npwd: "新密码", loginBtn: "登录", setBtn: "设置并进入", forgot: "忘记密码？", resetLink: "使用现有登录方式重置密码", reset: "重置密码", resetBtn: "重置并进入" },
-    en: { title: "Mailbox Administration", login: "Password login", set: "Set admin password", pwd: "Password", npwd: "New password", loginBtn: "Log in", setBtn: "Set and enter", forgot: "Forgot password?", resetLink: "Reset using the existing login", reset: "Reset password", resetBtn: "Reset and enter" }
-  };
-  var lang = "zh";
-  function setLang(next) { lang = next; langBtn.textContent = next === "zh" ? "EN" : "中文"; applyStrings(); }
-  function applyStrings() {
-    var s = I18N[lang]; title.textContent = s.title;
-    pwdLabel.firstChild.textContent = s.pwd + " "; npwdLabel.firstChild.textContent = s.npwd + " ";
-    modeText.textContent = resetMode ? (lang === "zh" ? "已有密码？" : "Have a password?") : s.forgot;
-    modeToggle.textContent = resetMode ? (lang === "zh" ? "返回登录" : "Back to login") : s.resetLink;
-    submit.textContent = resetMode ? s.resetBtn : (passwordSet ? s.loginBtn : s.setBtn);
-    subtitle.textContent = resetMode ? s.reset : (passwordSet ? s.login : s.set);
-  }
-  langBtn.addEventListener("click", function () { setLang(lang === "zh" ? "en" : "zh"); });
-
-  var siteKey = null, passwordSet = false, resetMode = false;
-  var turnstileToken = null;
-  function turnstileAvailable() { return typeof window.turnstile !== "undefined" && siteKey; }
-
-  fetch("/api/auth/status", { headers: { Accept: "application/json" } }).then(function (r) { return r.json(); }).then(function (s) {
-    if (s.authenticated) { window.location.replace("/"); return; }
-    if (!s.enabled) { window.location.replace("/"); return; }
-    siteKey = s.siteKey || null; passwordSet = !!s.passwordSet;
-    if (turnstileAvailable()) {
-      window.turnstile.render(form, { sitekey: siteKey, size: "invisible", callback: function (token) { turnstileToken = token; doSubmit(); } });
-    }
-    applyStrings();
-  }).catch(function () { statusEl.textContent = "加载失败"; });
-
-  modeToggle.addEventListener("click", function () {
-    resetMode = !resetMode;
-    pwdLabel.hidden = resetMode; npwdLabel.hidden = !resetMode;
-    pwd.setAttribute("autocomplete", resetMode ? "new-password" : "current-password");
-    applyStrings();
-  });
-
-  function doSubmit() {
-    var value = pwd.value.trim();
-    if (!value) { statusEl.textContent = lang === "zh" ? "请输入密码" : "Enter a password"; return; }
-    var path = resetMode ? "/api/auth/reset" : "/api/auth/login";
-    var body = resetMode ? { newPassword: value } : { password: value };
-    if (turnstileAvailable()) body.turnstileToken = turnstileToken;
-    fetch(path, { method: "POST", headers: { "Content-Type": "application/json", Origin: window.location.origin }, body: JSON.stringify(body) })
-      .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
-      .then(function (res) {
-        if (res.status === 200) { window.location.replace("/"); return; }
-        var map = { INVALID_PASSWORD: lang === "zh" ? "密码错误" : "Wrong password", INVALID_TURNSTILE: lang === "zh" ? "人机验证未通过" : "Verification failed", INVALID_INPUT: lang === "zh" ? "密码太短（至少 8 位）" : "Password too short (min 8)" };
-        statusEl.textContent = map[res.body.error] || (res.body.error || "请求失败");
-      }).catch(function () { statusEl.textContent = lang === "zh" ? "请求失败" : "Request failed"; });
-  }
-
-  form.addEventListener("submit", function (e) {
-    e.preventDefault();
-    if (turnstileAvailable()) { window.turnstile.execute(form); return; }
-    doSubmit();
-  });
-})();
-</script>
+<script src="/login.js"></script>
 </body></html>

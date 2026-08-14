@@ -9,10 +9,10 @@ import { createCsrfToken, csrfCookie, validateCsrf } from "./csrf";
 
 const BODY_LIMIT = 65_536;
 const STATUSES: readonly MailboxStatus[] = [
-  "pending", "active", "failed", "resetting", "reset_unknown", "deleting", "delete_failed",
+  "registered", "pending", "activating", "active", "failed", "resetting", "reset_unknown", "deleting", "delete_failed",
 ];
 const SECURITY_HEADERS: Readonly<Record<string,string>> = {
-  "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+  "Content-Security-Policy": "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self'; img-src 'self'; connect-src 'self' https://challenges.cloudflare.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; frame-src 'self' https://challenges.cloudflare.com",
   "X-Content-Type-Options": "nosniff",
   "Referrer-Policy": "no-referrer",
 };
