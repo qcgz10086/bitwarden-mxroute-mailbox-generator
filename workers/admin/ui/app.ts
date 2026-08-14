@@ -441,7 +441,10 @@ function bind(): void {
 function applyStaticTranslations(): void {
   document.documentElement.lang = currentLanguage();
   document.title = t("title");
-  for (const node of document.querySelectorAll("[data-i18n]")) text(node, t(node.dataset.i18n));
+  for (const node of document.querySelectorAll("[data-i18n]")) {
+    if (node.querySelector("input, select, textarea, button")) continue;
+    text(node, t(node.dataset.i18n));
+  }
   for (const node of document.querySelectorAll("[data-i18n-placeholder]")) node.placeholder = t(node.dataset.i18nPlaceholder);
   text(byId("lang-toggle"), t("langToggle"));
 }
