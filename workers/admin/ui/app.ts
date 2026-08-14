@@ -221,7 +221,7 @@ type BrowserRequestInit = RequestInit & { credentials?: "same-origin"; keepalive
 type Fetcher = (input: RequestInfo | URL, init?: BrowserRequestInit) => Promise<Response>;
 export class AdminApi {
   private csrfToken: string | null = null;
-  constructor(private readonly fetcher: Fetcher = fetch as Fetcher) {}
+  constructor(private readonly fetcher: Fetcher = (input, init) => fetch(input, init)) {}
   async initialize(): Promise<void> { const session = await this.request<{ csrfToken: string }>("/api/session", { method: "GET" }); this.csrfToken = session.csrfToken; }
   get<T>(path: string, signal?: AbortSignal): Promise<T> {
     const init: BrowserRequestInit = { method: "GET" }; if (signal) init.signal = signal; return this.request<T>(path, init);
