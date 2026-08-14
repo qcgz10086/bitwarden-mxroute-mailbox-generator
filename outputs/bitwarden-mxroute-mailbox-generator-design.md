@@ -75,9 +75,12 @@ Content-Type: application/json
   "enabled": true,
   "creation_timestamp": 1786612345,
   "name": null,
-  "note": null
+  "note": null,
+  "alias": "k7m4x9q2wp6c@example.com"
 }
 ```
+
+`alias` 重复 `email`：Bitwarden 当前 SimpleLogin 集成从响应 JSON 读取 `json.alias` 作为生成的转发地址；缺少该字段时 Bitwarden 会报 "Unknown SimpleLogin error"（即使邮箱已在 MXroute 创建成功）。保留完整 alias 对象以兼容旧客户端读取 `email`。
 
 错误响应使用 SimpleLogin 兼容格式：
 

@@ -85,13 +85,13 @@ function expectNoCredentialFields(value: unknown): void {
 }
 
 describe("Generator Worker", () => {
-  it("returns the exact SimpleLogin alias body and extracts Authentication", async () => {
+  it("returns the SimpleLogin alias body with the email repeated as alias", async () => {
     const env = environment();
 
     const response = await dispatch(request(), env);
 
     expect(response.status).toBe(201);
-    expect(await json(response)).toEqual(ALIAS);
+    expect(await json(response)).toEqual({ ...ALIAS, alias: ALIAS.email });
     expect(env.CORE.generateMailbox).toHaveBeenCalledOnce();
     expect(env.CORE.generateMailbox).toHaveBeenCalledWith(TOKEN);
     expect(response.headers.get("X-Request-Id")).toBe("core-request-01");
@@ -112,7 +112,7 @@ describe("Generator Worker", () => {
     const response = await dispatch(request(), env);
     const body = await json(response);
 
-    expect(body).toEqual(ALIAS);
+    expect(body).toEqual({ ...ALIAS, alias: ALIAS.email });
     expectNoCredentialFields(body);
     expect(JSON.stringify(body)).not.toContain("MustNeverReachBitwarden2");
   });

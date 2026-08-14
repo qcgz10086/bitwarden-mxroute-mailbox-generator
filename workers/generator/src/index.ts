@@ -88,7 +88,7 @@ export default {
       if (alias === null) {
         return error("Mailbox service temporarily unavailable", 503, responseRequestId);
       }
-      return json(alias, 201, responseRequestId);
+      return json({ ...alias, alias: alias.email }, 201, responseRequestId);
     } catch (caught) {
       return mappedCoreError(caught, requestId);
     }
