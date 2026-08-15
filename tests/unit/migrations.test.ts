@@ -6,7 +6,7 @@ type TestEnv = Env & { TEST_MIGRATIONS: D1Migration[] };
 describe("Core D1 migrations", () => {
   it("upgrades a database where 0001 is already recorded", async () => {
     const migrations = (env as TestEnv).TEST_MIGRATIONS;
-    expect(migrations).toHaveLength(6);
+    expect(migrations).toHaveLength(7);
     await applyD1Migrations(env.DB, [migrations[0]!]);
     const before = await env.DB.prepare("PRAGMA table_info(mailboxes)").all<{ name: string }>();
     expect(before.results.map((column) => column.name)).not.toContain("recovery_attempt_count");
@@ -25,5 +25,8 @@ describe("Core D1 migrations", () => {
       "pending_expires_at", "acknowledged_at",
     ]));
     expect(tokenColumns.results.map((column) => column.name)).toContain("acknowledged_actor_id");
+    const settings = await env.DB.prepare("SELECT value FROM settings WHERE key = 'admin_password_version'").first<{ value: string }>();
+    expect(settings?.value).toBe("0");
+    expect(await env.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'login_attempts'").first()).not.toBeNull();
   });
 });

@@ -262,6 +262,11 @@ try {
     foreach ($requiredSecret in @('MXROUTE_SERVER', 'MXROUTE_USERNAME', 'MXROUTE_API_KEY', 'TOKEN_PEPPER', 'ENC_KEY_V1')) {
         if ($secretNames -notcontains $requiredSecret) { throw "Core secret $requiredSecret is not set." }
     }
+    $adminSecretJson = Invoke-Wrangler -Arguments @('secret', 'list', '--name', $script:Names.Admin, '--format', 'json', '--config', $script:AdminConfig) -Capture
+    $adminSecretNames = @($adminSecretJson | ConvertFrom-Json | ForEach-Object { $_.name })
+    if ($adminSecretNames -notcontains 'ADMIN_SESSION_KEY') {
+        throw 'Admin secret ADMIN_SESSION_KEY is not set; run set-secrets.ps1 first.'
+    }
     $target = "account=$script:AccountIdLower environment=$Environment configs=$script:ConfigDirectory database=$($script:Names.Database)/$databaseId workers=$($script:Names.Core),$($script:Names.Generator),$($script:Names.Admin) domains=$GeneratorHostname,$AdminHostname"
     if ($PSCmdlet.ShouldProcess($target, 'Apply migrations, deploy Core, and publish Access-ready Generator/Admin domains')) {
         Invoke-Wrangler -Arguments @('d1', 'migrations', 'apply', 'DB', '--remote', '--config', $script:CoreConfig)

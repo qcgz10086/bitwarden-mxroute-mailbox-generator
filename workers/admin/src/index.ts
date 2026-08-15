@@ -46,7 +46,11 @@ export interface AdminCore {
   pageAudit(identity: AdminIdentity, options: PageAuditOptions): Promise<AuditPage>;
   isAdminPasswordSet(): Promise<boolean>;
   verifyAdminPassword(password: string): Promise<boolean>;
-  setAdminPassword(identity: AdminIdentity, newPassword: string): Promise<{ requestId: string }>;
+  setAdminPassword(identity: AdminIdentity, newPassword: string): Promise<{ requestId: string; passwordVersion: number }>;
+  getAdminPasswordVersion(): Promise<number>;
+  recordLoginFailure(key: string, nowIso: string): Promise<void>;
+  isLoginBlocked(key: string, nowIso: string): Promise<boolean>;
+  clearLoginFailures(key: string): Promise<void>;
 }
 export interface AdminEnv {
   readonly CORE: AdminCore;
@@ -57,7 +61,7 @@ export interface AdminEnv {
   readonly ADMIN_ORIGIN: string;
   readonly TURNSTILE_SITE_KEY?: string;
   readonly TURNSTILE_SECRET_KEY?: string;
-  readonly ADMIN_SESSION_KEY?: string;
+  readonly ADMIN_SESSION_KEY: string;
 }
 
 class HttpError extends Error {
@@ -73,7 +77,21 @@ export function createAdminHandler(dependencies: { jwks?: JWTVerifyGetKey } = {}
         const url = new URL(request.url);
         const isApi = url.pathname === "/api" || url.pathname.startsWith("/api/");
         const method = request.method.toUpperCase();
-        const sessionEnabled = typeof env.ADMIN_SESSION_KEY === "string" && env.ADMIN_SESSION_KEY.length > 0;
+        const sessionEnabled = adminSessionKeyConfigured(env.ADMIN_SESSION_KEY);
+
+        if (url.pathname === "/api/auth/status") {
+          requireMethod(method, "GET");
+          return json({
+            enabled: sessionEnabled,
+            authenticated: sessionEnabled ? (await adminSessionPayload(request, env)) !== null : false,
+            passwordSet: await env.CORE.isAdminPasswordSet(),
+            siteKey: env.TURNSTILE_SITE_KEY ?? null,
+          }, 200);
+        }
+
+        if (!sessionEnabled) {
+          throw new HttpError(503, "SERVER_MISCONFIGURED");
+        }
 
         // Reset paths require the existing login method (Cloudflare Access) to verify identity.
         if (url.pathname === "/reset" || url.pathname === "/reset.html" || url.pathname === "/api/auth/reset") {
@@ -95,8 +113,10 @@ export function createAdminHandler(dependencies: { jwks?: JWTVerifyGetKey } = {}
           if (env.TURNSTILE_SECRET_KEY !== undefined && !(await verifyTurnstile(env.TURNSTILE_SECRET_KEY, turnstileToken, request))) {
             throw new HttpError(400, "INVALID_TURNSTILE");
           }
-          await env.CORE.setAdminPassword(identity, newPassword);
-          return json({ ok: true }, 200, { "Set-Cookie": await issueAdminSession(env.ADMIN_SESSION_KEY!) });
+          const passwordVersion = (await env.CORE.setAdminPassword(identity, newPassword)).passwordVersion;
+          await env.CORE.clearLoginFailures("global");
+          await env.CORE.clearLoginFailures(loginKey(request));
+          return json({ ok: true }, 200, { "Set-Cookie": await issueAdminSession(env.ADMIN_SESSION_KEY, passwordVersion) });
         }
 
         // Login page status, login, and logout do not require a session.
@@ -104,9 +124,10 @@ export function createAdminHandler(dependencies: { jwks?: JWTVerifyGetKey } = {}
           || url.pathname === "/api/auth/login"
           || url.pathname === "/api/auth/logout";
 
-        if (sessionEnabled && !openAuth) {
-          const authenticated = await adminSessionValid(request, env.ADMIN_SESSION_KEY!);
-          if (!authenticated) {
+        let sessionPayload: AdminSessionPayload | null = null;
+        if (!openAuth) {
+          sessionPayload = await adminSessionPayload(request, env);
+          if (sessionPayload === null) {
             if (isApi) {
               return secure(json({ error: "ADMIN_LOGIN_REQUIRED" }, 401));
             }
@@ -121,15 +142,6 @@ export function createAdminHandler(dependencies: { jwks?: JWTVerifyGetKey } = {}
         if (!isApi) {
           return secure(await env.ASSETS.fetch(request));
         }
-        if (url.pathname === "/api/auth/status") {
-          requireMethod(method, "GET");
-          return json({
-            enabled: sessionEnabled,
-            authenticated: sessionEnabled ? await adminSessionValid(request, env.ADMIN_SESSION_KEY!) : true,
-            passwordSet: await env.CORE.isAdminPasswordSet(),
-            siteKey: env.TURNSTILE_SITE_KEY ?? null,
-          }, 200);
-        }
         if (url.pathname === "/api/auth/login") {
           requireMethod(method, "POST");
           rejectQuery(url, new Set());
@@ -140,10 +152,21 @@ export function createAdminHandler(dependencies: { jwks?: JWTVerifyGetKey } = {}
           if (env.TURNSTILE_SECRET_KEY !== undefined && !(await verifyTurnstile(env.TURNSTILE_SECRET_KEY, turnstileToken, request))) {
             throw new HttpError(400, "INVALID_TURNSTILE");
           }
+          const now = new Date().toISOString();
+          const globalKey = "global";
+          const ipKey = loginKey(request);
+          if (await env.CORE.isLoginBlocked(globalKey, now) || await env.CORE.isLoginBlocked(ipKey, now)) {
+            throw new HttpError(429, "RATE_LIMITED");
+          }
           if (!(await env.CORE.verifyAdminPassword(password))) {
+            await env.CORE.recordLoginFailure(globalKey, now);
+            await env.CORE.recordLoginFailure(ipKey, now);
             throw new HttpError(401, "INVALID_PASSWORD");
           }
-          return json({ ok: true }, 200, { "Set-Cookie": await issueAdminSession(env.ADMIN_SESSION_KEY!) });
+          await env.CORE.clearLoginFailures(globalKey);
+          await env.CORE.clearLoginFailures(ipKey);
+          const passwordVersion = await env.CORE.getAdminPasswordVersion();
+          return json({ ok: true }, 200, { "Set-Cookie": await issueAdminSession(env.ADMIN_SESSION_KEY, passwordVersion) });
         }
         if (url.pathname === "/api/auth/logout") {
           requireMethod(method, "POST");
@@ -153,7 +176,10 @@ export function createAdminHandler(dependencies: { jwks?: JWTVerifyGetKey } = {}
         if (["POST", "PUT", "DELETE"].includes(method) && !validateCsrf(request, env.ADMIN_ORIGIN)) {
           throw new HttpError(403, "FORBIDDEN");
         }
-        const identity = { subject: "password-admin", email: "" };
+        if (sessionPayload === null) {
+          throw new HttpError(401, "ADMIN_LOGIN_REQUIRED");
+        }
+        const identity = passwordAdminIdentity(sessionPayload);
         return secure(await route(request, url, method, identity, env.CORE));
       } catch (error) {
         if (error instanceof AccessError) return secure(json({ error: "UNAUTHORIZED" }, 401));
@@ -487,27 +513,96 @@ function cookieValue(cookieHeader: string | null, name: string): string | null {
   return null;
 }
 
-async function adminSessionValid(request: Request, key: string): Promise<boolean> {
+function loginKey(request: Request): string {
+  const direct = request.headers.get("CF-Connecting-IP");
+  if (direct !== null && direct.length > 0) return `login:${direct}`;
+  const forwarded = request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim();
+  return forwarded !== undefined && forwarded.length > 0 ? `login:${forwarded}` : "login:unknown";
+}
+
+interface AdminSessionPayload {
+  readonly exp: number;
+  readonly pwdVersion: number;
+  readonly sid: string;
+}
+
+function encodeSessionPayload(payload: AdminSessionPayload): string {
+  return toBase64Url(new TextEncoder().encode(JSON.stringify(payload)));
+}
+
+function decodeBase64Url(value: string): Uint8Array {
+  const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+  const binary = atob(padded);
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+}
+
+function decodeSessionPayload(value: string): AdminSessionPayload | null {
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(decodeBase64Url(value))) as Partial<AdminSessionPayload>;
+    if (
+      typeof parsed.exp !== "number"
+      || !Number.isFinite(parsed.exp)
+      || typeof parsed.pwdVersion !== "number"
+      || !Number.isInteger(parsed.pwdVersion)
+      || typeof parsed.sid !== "string"
+      || parsed.sid.length === 0
+    ) {
+      return null;
+    }
+    return { exp: parsed.exp, pwdVersion: parsed.pwdVersion, sid: parsed.sid };
+  } catch {
+    return null;
+  }
+}
+
+function adminSessionKeyConfigured(value: string | undefined): boolean {
+  if (typeof value !== "string" || value.length < 32 || !/^[A-Za-z0-9_-]+$/.test(value)) {
+    return false;
+  }
+  try {
+    return decodeBase64Url(value).length >= 32;
+  } catch {
+    return false;
+  }
+}
+
+async function adminSessionPayload(request: Request, env: AdminEnv): Promise<AdminSessionPayload | null> {
   const cookie = cookieValue(request.headers.get("Cookie"), "admin_session");
-  if (cookie === null) return false;
+  if (cookie === null) return null;
   const dot = cookie.indexOf(".");
-  if (dot <= 0) return false;
-  const expiry = Number(cookie.slice(0, dot));
+  if (dot <= 0) return null;
+  const encodedPayload = cookie.slice(0, dot);
   const signature = cookie.slice(dot + 1);
-  if (!Number.isFinite(expiry) || expiry <= Math.floor(Date.now() / 1_000)) return false;
-  const expected = toBase64Url(await hmacKey(key, String(expiry)));
-  if (signature.length !== expected.length) return false;
+  const payload = decodeSessionPayload(encodedPayload);
+  if (payload === null || payload.exp <= Math.floor(Date.now() / 1_000)) return null;
+  const passwordVersion = await env.CORE.getAdminPasswordVersion();
+  if (payload.pwdVersion !== passwordVersion) return null;
+  const expected = toBase64Url(await hmacKey(env.ADMIN_SESSION_KEY, encodedPayload));
+  if (signature.length !== expected.length) return null;
   let difference = 0;
   for (let index = 0; index < signature.length; index += 1) {
     difference |= signature.charCodeAt(index) ^ expected.charCodeAt(index);
   }
-  return difference === 0;
+  return difference === 0 ? payload : null;
 }
 
-async function issueAdminSession(key: string): Promise<string> {
-  const expiry = Math.floor(Date.now() / 1_000) + 12 * 3_600;
-  const signature = toBase64Url(await hmacKey(key, String(expiry)));
-  return `admin_session=${expiry}.${signature}; Max-Age=${12 * 3_600}; Path=/; HttpOnly; Secure; SameSite=Strict`;
+function passwordAdminIdentity(payload: AdminSessionPayload): AdminIdentity {
+  return {
+    subject: `password-admin:v${payload.pwdVersion}:${payload.sid}`,
+    email: "password-admin@local",
+  };
+}
+
+async function issueAdminSession(key: string, passwordVersion: number): Promise<string> {
+  const payload = {
+    exp: Math.floor(Date.now() / 1_000) + 12 * 3_600,
+    pwdVersion: passwordVersion,
+    sid: crypto.randomUUID(),
+  };
+  const encoded = encodeSessionPayload(payload);
+  const signature = toBase64Url(await hmacKey(key, encoded));
+  return `admin_session=${encoded}.${signature}; Max-Age=${12 * 3_600}; Path=/; HttpOnly; Secure; SameSite=Strict`;
 }
 
 async function verifyTurnstile(secret: string, token: string, request: Request): Promise<boolean> {

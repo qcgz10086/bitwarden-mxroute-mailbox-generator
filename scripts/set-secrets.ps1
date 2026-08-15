@@ -79,14 +79,14 @@ function New-Base64UrlSecret {
 }
 
 function Invoke-SecretPut {
-    param([string]$Name, [Security.SecureString]$SecureValue, [string]$PlainValue)
+    param([string]$Name, [Security.SecureString]$SecureValue, [string]$PlainValue, [string]$WorkerName = $script:CoreName, [string]$WorkerConfig = $script:CoreConfig)
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $script:NodePath
     $start.UseShellExecute = $false
     $start.RedirectStandardInput = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
-    $arguments = @($script:WranglerPath, 'secret', 'put', $Name, '--name', $script:CoreName, '--config', $script:CoreConfig)
+    $arguments = @($script:WranglerPath, 'secret', 'put', $Name, '--name', $WorkerName, '--config', $WorkerConfig)
     if (-not [string]::IsNullOrWhiteSpace($script:Profile)) { $arguments += @('--profile', $script:Profile) }
     foreach ($argument in $arguments) { [void]$start.ArgumentList.Add($argument) }
 
@@ -175,5 +175,17 @@ try {
         $generated = New-Base64UrlSecret
         try { Invoke-SecretPut -Name $name -PlainValue $generated } finally { $generated = $null }
         Write-Host "${name}: SET"
+    }
+    $adminSecretText = Invoke-WranglerRead @('secret', 'list', '--name', $script:AdminName, '--format', 'json', '--config', $script:AdminConfig)
+    $adminSecrets = @($adminSecretText | ConvertFrom-Json | ForEach-Object { $_.name })
+    if ($adminSecrets -contains 'ADMIN_SESSION_KEY') {
+        Write-Host 'ADMIN_SESSION_KEY: PRESENT'
+    } else {
+        if (-not $PSCmdlet.ShouldProcess("account=$script:AccountIdLower environment=$Environment config=$script:AdminConfig worker=$script:AdminName secret=ADMIN_SESSION_KEY", 'Generate and set 256-bit session key through Wrangler stdin')) { Write-Host 'ADMIN_SESSION_KEY: WOULD SET'; return }
+        $generated = New-Base64UrlSecret
+        try {
+            Invoke-SecretPut -Name 'ADMIN_SESSION_KEY' -PlainValue $generated -WorkerName $script:AdminName -WorkerConfig $script:AdminConfig
+        } finally { $generated = $null }
+        Write-Host 'ADMIN_SESSION_KEY: SET'
     }
 } finally { Pop-Location }

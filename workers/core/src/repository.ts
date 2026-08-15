@@ -60,6 +60,8 @@ export interface MailboxRecord {
   readonly email: string;
   readonly localPart: string;
   readonly domain: string;
+  readonly reservationDate: string | null;
+  readonly reservationTokenId: string | null;
   readonly passwordCiphertext: Uint8Array | null;
   readonly passwordNonce: Uint8Array | null;
   readonly encryptionKeyVersion: number | null;
@@ -183,6 +185,8 @@ type MailboxRow = {
   email: string;
   local_part: string;
   domain: string;
+  reservation_date: string | null;
+  reservation_token_id: string | null;
   password_ciphertext: unknown;
   password_nonce: unknown;
   encryption_key_version: number;
@@ -250,6 +254,8 @@ const MAILBOX_COLUMNS = `
   email,
   local_part,
   domain,
+  reservation_date,
+  reservation_token_id,
   password_ciphertext,
   password_nonce,
   encryption_key_version,
@@ -308,6 +314,8 @@ export class Repository {
     }
   }
 
+  // Daily quota is charged at registration and released when an unused
+  // reservation is deleted locally; real MXroute accounts remain managed.
   async registerMailbox(input: RegisterMailboxInput): Promise<void> {
     try {
       await this.db.batch([
@@ -319,16 +327,20 @@ export class Repository {
             email,
             local_part,
             domain,
+            reservation_date,
+            reservation_token_id,
             quota_mb,
             status,
             created_at,
             updated_at
-          ) VALUES(?, ?, ?, ?, ?, 'registered', ?, ?)`)
+          ) VALUES(?, ?, ?, ?, ?, ?, ?, 'registered', ?, ?)`)
           .bind(
             input.publicId,
             input.email,
             input.localPart,
             input.domain,
+            input.date,
+            input.tokenId,
             input.quotaMb,
             input.now,
             input.now,
@@ -449,7 +461,8 @@ export class Repository {
   async failPendingMailboxWithAudit(publicId: string, failureCode: string, updatedAt: string, event: AuditEventInput): Promise<void> {
     await this.mutateWithAudit(this.db.prepare(`UPDATE mailboxes
       SET status = 'failed', failure_code = ?, updated_at = ?,
-          reservation_date = NULL, reservation_token_id = NULL
+          reservation_date = CASE WHEN status = 'activating' THEN reservation_date ELSE NULL END,
+          reservation_token_id = CASE WHEN status = 'activating' THEN reservation_token_id ELSE NULL END
       WHERE public_id = ? AND status IN ('pending', 'activating')`).bind(failureCode, updatedAt, publicId), event);
   }
 
@@ -685,6 +698,16 @@ export class Repository {
     requireSingleChange(audit);
   }
 
+  async removeUnmanagedMailboxWithAudit(publicId: string, event: AuditEventInput): Promise<void> {
+    const [removal, audit] = await this.db.batch([
+      this.db.prepare("DELETE FROM mailboxes WHERE public_id = ? AND status IN ('registered', 'activating', 'failed')")
+        .bind(publicId),
+      auditStatement(this.db, event, true),
+    ]);
+    requireAtLeastOneChange(removal);
+    requireSingleChange(audit);
+  }
+
   async syncDomains(domains: readonly string[], syncedAt: string): Promise<void> {
     const statements = [
       this.db.prepare("UPDATE domains SET is_active = 0, synced_at = ?")
@@ -781,9 +804,56 @@ export class Repository {
     return row?.value ?? null;
   }
 
-  async setAdminPasswordHashWithAudit(hash: string, event: AuditEventInput): Promise<void> {
-    await this.mutateWithAudit(this.db.prepare(`INSERT INTO settings(key, value) VALUES('admin_password_hash', ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(hash), event);
+  async getAdminPasswordVersion(): Promise<number> {
+    const row = await this.db.prepare("SELECT value FROM settings WHERE key = 'admin_password_version'").first<{ value: string }>();
+    const value = Number(row?.value ?? "0");
+    return Number.isInteger(value) && value >= 0 ? value : 0;
+  }
+
+  async setAdminPasswordHashWithAudit(hash: string, event: AuditEventInput): Promise<number> {
+    const [hashUpdate, versionUpdate, audit] = await this.db.batch([
+      this.db.prepare(`INSERT INTO settings(key, value) VALUES('admin_password_hash', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(hash),
+      this.db.prepare(`UPDATE settings SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+        WHERE key = 'admin_password_version'`),
+      auditStatement(this.db, event, true),
+    ]);
+    requireSingleChange(hashUpdate);
+    requireSingleChange(versionUpdate);
+    requireSingleChange(audit);
+    return this.getAdminPasswordVersion();
+  }
+
+  async recordLoginFailure(key: string, nowIso: string): Promise<void> {
+    const current = await this.db.prepare(
+      "SELECT failures, blocked_until FROM login_attempts WHERE key = ?",
+    ).bind(key).first<{ failures: number; blocked_until: string | null }>();
+    if (current !== null && current.blocked_until !== null && current.blocked_until <= nowIso) {
+      await this.db.prepare("UPDATE login_attempts SET failures = 1, blocked_until = NULL WHERE key = ?")
+        .bind(key)
+        .run();
+      return;
+    }
+    const blockedUntil = new Date(new Date(nowIso).getTime() + 10 * 60_000).toISOString();
+    await this.db.prepare(`INSERT INTO login_attempts(key, failures, blocked_until)
+        VALUES(?, 1, NULL)
+      ON CONFLICT(key) DO UPDATE SET
+        failures = failures + 1,
+        blocked_until = CASE WHEN failures + 1 >= 5 THEN ? ELSE blocked_until END`)
+      .bind(key, blockedUntil)
+      .run();
+  }
+
+  async isLoginBlocked(key: string, nowIso: string): Promise<boolean> {
+    const row = await this.db.prepare(`SELECT failures >= 5 AS blocked
+      FROM login_attempts WHERE key = ? AND blocked_until > ?`)
+      .bind(key, nowIso)
+      .first<{ blocked: number }>();
+    return row?.blocked === 1;
+  }
+
+  async clearLoginFailures(key: string): Promise<void> {
+    await this.db.prepare("DELETE FROM login_attempts WHERE key = ?").bind(key).run();
   }
 
   async updateSettings(patch: SettingsPatch): Promise<void> {
@@ -1072,6 +1142,8 @@ function mapMailbox(row: MailboxRow): MailboxRecord {
     email: row.email,
     localPart: row.local_part,
     domain: row.domain,
+    reservationDate: row.reservation_date,
+    reservationTokenId: row.reservation_token_id,
     passwordCiphertext: row.password_ciphertext === null
       ? null
       : fromBlob(row.password_ciphertext),
@@ -1138,6 +1210,12 @@ function fromBlob(value: unknown): Uint8Array {
 
 function requireSingleChange(result: D1Result<unknown> | undefined): void {
   if (Number(result?.meta.changes ?? 0) !== 1) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+}
+
+function requireAtLeastOneChange(result: D1Result<unknown> | undefined): void {
+  if (Number(result?.meta.changes ?? 0) < 1) {
     throw new RepositoryError("INVALID_STATE");
   }
 }

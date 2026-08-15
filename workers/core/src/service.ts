@@ -351,7 +351,35 @@ export class AdministrationService {
       await this.audit(identity, "mailbox.delete", mailbox.email, "failure", "CONFIRMATION_MISMATCH", requestId);
       throw new AdminError("CONFIRMATION_MISMATCH", requestId);
     }
-    if (!["active", "failed", "delete_failed", "reset_unknown"].includes(mailbox.status)) {
+    if (mailbox.status === "registered") {
+      try {
+        await this.dependencies.repository.removeUnmanagedMailboxWithAudit(publicId,
+          this.adminEvent(identity, "mailbox.delete", mailbox.email, "success", null, requestId));
+        return { requestId };
+      } catch (error) {
+        const code = repositoryAdminCode(error);
+        await this.audit(identity, "mailbox.delete", mailbox.email, "failure", code, requestId);
+        throw new AdminError(code, requestId);
+      }
+    }
+    if (mailbox.status === "activating" || mailbox.status === "failed") {
+      try {
+        await this.dependencies.mxroute.getMailbox(mailbox.domain, mailbox.localPart);
+      } catch (error) {
+        if (serviceCode(error) === "MX_NOT_FOUND") {
+          try {
+            await this.dependencies.repository.removeUnmanagedMailboxWithAudit(publicId,
+              this.adminEvent(identity, "mailbox.delete", mailbox.email, "success", null, requestId));
+            return { requestId };
+          } catch (repositoryError) {
+            const code = repositoryAdminCode(repositoryError);
+            await this.audit(identity, "mailbox.delete", mailbox.email, "failure", code, requestId);
+            throw new AdminError(code, requestId);
+          }
+        }
+      }
+    }
+    if (!["active", "activating", "failed", "delete_failed", "reset_unknown"].includes(mailbox.status)) {
       await this.audit(identity, "mailbox.delete", mailbox.email, "failure", "INVALID_STATE", requestId);
       throw new AdminError("INVALID_STATE", requestId);
     }
@@ -471,6 +499,34 @@ export class AdministrationService {
         throw new ServiceError("MX_INVALID_RESPONSE");
       }
     } catch (error) {
+      if (asServiceError(error)?.code === "MX_CONFLICT") {
+        let remoteIsOurs = false;
+        try {
+          const existing = await this.dependencies.mxroute.getMailbox(mailbox.domain, mailbox.localPart);
+          remoteIsOurs = existing.username === mailbox.localPart
+            && existing.email === mailbox.email
+            && existing.quotaMb === mailbox.quotaMb
+            && existing.limit === EXPECTED_MAILBOX_LIMIT;
+        } catch (existenceError) {
+          const existenceCode = serviceCode(existenceError);
+          if (existenceCode !== "MX_NOT_FOUND") {
+            const code = existenceCode ?? "INTERNAL_ERROR";
+            await this.audit(identity, "mailbox.confirm", mailbox.email, "failure", code, requestId);
+            throw new AdminError(code, requestId, existenceCode !== null && isAmbiguous(existenceCode));
+          }
+        }
+        if (remoteIsOurs) {
+          try {
+            await this.dependencies.repository.activateMailboxWithAudit(publicId, now,
+              this.adminEvent(identity, "mailbox.confirm", mailbox.email, "success", null, requestId));
+            return { requestId };
+          } catch (activationError) {
+            const code = repositoryAdminCode(activationError);
+            await this.audit(identity, "mailbox.confirm", mailbox.email, "failure", code, requestId);
+            throw new AdminError(code, requestId);
+          }
+        }
+      }
       if (isUncertainUpstreamFailure(error)) {
         const code = asServiceError(error)?.code ?? "MX_TIMEOUT";
         await this.audit(identity, "mailbox.confirm", mailbox.email, "failure", code, requestId);
@@ -506,7 +562,7 @@ export class AdministrationService {
     return stored !== null && verifyPasswordHash(password, stored);
   }
 
-  async setAdminPassword(identity: AdminIdentity, newPassword: string): Promise<{ requestId: string }> {
+  async setAdminPassword(identity: AdminIdentity, newPassword: string): Promise<{ requestId: string; passwordVersion: number }> {
     const requestId = this.createId("request");
     if (newPassword.length < 8 || newPassword.length > 128) {
       await this.audit(identity, "admin.password", null, "failure", "INVALID_INPUT", requestId);
@@ -514,14 +570,30 @@ export class AdministrationService {
     }
     try {
       const hash = await hashAdminPassword(newPassword);
-      await this.dependencies.repository.setAdminPasswordHashWithAudit(hash,
+      const passwordVersion = await this.dependencies.repository.setAdminPasswordHashWithAudit(hash,
         this.adminEvent(identity, "admin.password", null, "success", null, requestId));
-      return { requestId };
+      return { requestId, passwordVersion };
     } catch (error) {
       const code = repositoryAdminCode(error);
       await this.audit(identity, "admin.password", null, "failure", code, requestId);
       throw new AdminError(code, requestId);
     }
+  }
+
+  async getAdminPasswordVersion(): Promise<number> {
+    return this.dependencies.repository.getAdminPasswordVersion();
+  }
+
+  async recordLoginFailure(key: string, nowIso: string): Promise<void> {
+    await this.dependencies.repository.recordLoginFailure(key, nowIso);
+  }
+
+  async isLoginBlocked(key: string, nowIso: string): Promise<boolean> {
+    return this.dependencies.repository.isLoginBlocked(key, nowIso);
+  }
+
+  async clearLoginFailures(key: string): Promise<void> {
+    await this.dependencies.repository.clearLoginFailures(key);
   }
 
   async updateSettings(identity: AdminIdentity, patch: AdminSettingsPatch): Promise<{ requestId: string }> {

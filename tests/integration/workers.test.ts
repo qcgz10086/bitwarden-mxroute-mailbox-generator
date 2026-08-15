@@ -20,6 +20,7 @@ describe.sequential("three Worker integration", () => {
     setMode(mode: MxMode): Promise<void>;
     getWrites(): Promise<Array<{ method: string; path: string; body: Record<string, unknown> }>>;
   };
+  let adminCookie = "";
   let db: D1Database;
   let issueAccess: Awaited<ReturnType<typeof accessFixture>>["issue"];
   let jwks: Awaited<ReturnType<typeof accessFixture>>["jwks"];
@@ -48,6 +49,9 @@ describe.sequential("three Worker integration", () => {
         { configPath: "workers/generator/wrangler.jsonc" },
         {
           configPath: "workers/admin/wrangler.jsonc",
+          secrets: {
+            ADMIN_SESSION_KEY: "admin-session-key-00000000000000000000000000000000",
+          },
           vars: {
             ACCESS_TEAM_DOMAIN: "https://team.cloudflareaccess.com", ACCESS_AUD: "admin-aud",
             ADMIN_EMAILS: "admin@example.com", ADMIN_ORIGIN: ORIGIN,
@@ -64,6 +68,7 @@ describe.sequential("three Worker integration", () => {
     mx = await server.getWorker("integration-mxroute").getExport() as unknown as typeof mx;
     await core.applyD1Migrations("DB" as never);
     db = (await core.getEnv() as CoreEnv).DB;
+    await resetAdminSession();
     const setupCsrf = await csrf();
     const sync = await adminMutation("/api/domains/sync", "POST", {}, setupCsrf.csrfToken, setupCsrf.cookie);
     expect(sync.status, await sync.clone().text()).toBe(200);
@@ -79,6 +84,7 @@ describe.sequential("three Worker integration", () => {
     await mx.reset();
     await db.prepare("DROP TRIGGER IF EXISTS integration_fail_activation").run();
     await db.batch([
+      db.prepare("UPDATE mailboxes SET status = 'deleting', reservation_date = NULL, reservation_token_id = NULL"),
       db.prepare("DELETE FROM mailboxes"),
       db.prepare("DELETE FROM creation_counters"),
       db.prepare("UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,'2026-08-13T00:00:00.000Z')"),
@@ -94,17 +100,14 @@ describe.sequential("three Worker integration", () => {
     expect(JSON.stringify(alias)).not.toContain("password");
     expect((await mx.getWrites()).filter((write) => write.method === "POST")).toHaveLength(0);
 
-    const session = await adminRequest("/api/session");
-    expect(session.status).toBe(200);
-    const { csrfToken } = await session.json() as { csrfToken: string };
-    const cookie = session.headers.get("set-cookie")!.split(";")[0]!;
+    const session = await csrf();
     const list = await adminRequest("/api/mailboxes");
     const page = await list.json() as { items: Array<{ publicId: string; email: string; status: string }> };
     expect(page.items.some((item) => item.email === alias.email)).toBe(true);
     const mailboxRow = page.items.find((item) => item.email === alias.email)!;
     expect(mailboxRow.status).toBe("registered");
 
-    const confirm = await adminMutation(`/api/mailboxes/${mailboxRow.publicId}/confirm`, "POST", {}, csrfToken, cookie);
+    const confirm = await adminMutation(`/api/mailboxes/${mailboxRow.publicId}/confirm`, "POST", {}, session.csrfToken, session.cookie);
     expect(confirm.status).toBe(200);
     const create = await lastWrite("POST");
     expect(create?.body.quota, JSON.stringify(await mx.getWrites())).toBe(100);
@@ -113,21 +116,40 @@ describe.sequential("three Worker integration", () => {
     await expectNoPlaintext(firstPassword);
     expect(await db.prepare("SELECT status FROM mailboxes WHERE public_id=?").bind(mailboxRow.publicId).first("status")).toBe("active");
 
-    const reveal = await adminMutation(`/api/mailboxes/${mailboxRow.publicId}/reveal`, "POST", {}, csrfToken, cookie);
+    const reveal = await adminMutation(`/api/mailboxes/${mailboxRow.publicId}/reveal`, "POST", {}, session.csrfToken, session.cookie);
     expect(reveal.status).toBe(200);
     expect((await reveal.json() as { password: string }).password).toBe(firstPassword);
-    const reset = await adminMutation(`/api/mailboxes/${mailboxRow.publicId}/reset`, "POST", {}, csrfToken, cookie);
+    const reset = await adminMutation(`/api/mailboxes/${mailboxRow.publicId}/reset`, "POST", {}, session.csrfToken, session.cookie);
     expect(reset.status).toBe(200);
     const secondPassword = (await reset.json() as { password: string }).password;
     expect(secondPassword).toHaveLength(18);
     expect(secondPassword).not.toBe(firstPassword);
     expect((await lastWrite("PATCH"))?.body.password).toBe(secondPassword);
     await expectNoPlaintext(secondPassword);
-    const deleted = await adminMutation(`/api/mailboxes/${mailboxRow.publicId}`, "DELETE", { confirmationEmail: alias.email }, csrfToken, cookie);
+    const deleted = await adminMutation(`/api/mailboxes/${mailboxRow.publicId}`, "DELETE", { confirmationEmail: alias.email }, session.csrfToken, session.cookie);
     expect(deleted.status).toBe(200);
     expect((await lastWrite("DELETE"))?.path).toContain(encodeURIComponent(alias.email.split("@")[0]!));
     expect(await db.prepare("SELECT COUNT(*) count FROM mailboxes WHERE public_id=?").bind(mailboxRow.publicId).first("count")).toBe(0);
     await revokeTokenByRawName("bitwarden-primary");
+  });
+
+  it("locally deletes a registered mailbox and frees the daily creation slot", async () => {
+    const { rawToken } = await createToken("registered-delete");
+    const first = await generate(rawToken);
+    expect(first.status).toBe(201);
+    const alias = await first.json() as { email: string };
+    const row = await db.prepare("SELECT public_id, reservation_token_id FROM mailboxes WHERE email=?").bind(alias.email).first<{ public_id: string; reservation_token_id: string }>();
+    const session = await csrf();
+
+    const deleted = await adminMutation(`/api/mailboxes/${row!.public_id}`, "DELETE", { confirmationEmail: alias.email }, session.csrfToken, session.cookie);
+    expect(deleted.status).toBe(200);
+    expect(await lastWrite("DELETE")).toBeUndefined();
+    expect(await db.prepare("SELECT COUNT(*) count FROM mailboxes WHERE public_id=?").bind(row!.public_id).first("count")).toBe(0);
+    expect(Number((await db.prepare("SELECT count FROM creation_counters WHERE token_id=?").bind(row!.reservation_token_id).first<{ count: number }>())?.count ?? 0)).toBe(0);
+
+    const second = await generate(rawToken);
+    expect(second.status).toBe(201);
+    await revokeTokenByRawName("registered-delete");
   });
 
   it("binds Generator to a least-privilege entrypoint while Admin routes retain management capability", async () => {
@@ -304,15 +326,32 @@ describe.sequential("three Worker integration", () => {
   }
 
   async function adminRequest(path: string) {
-    return admin.fetch(path, { headers: { "Cf-Access-Jwt-Assertion": await issueAccess() } });
+    const headers: Record<string, string> = { "Cf-Access-Jwt-Assertion": await issueAccess() };
+    if (adminCookie.length > 0) headers.Cookie = adminCookie;
+    return admin.fetch(path, { headers });
   }
 
   async function csrf(): Promise<{ csrfToken: string; cookie: string }> {
     const response = await adminRequest("/api/session");
+    const csrfCookie = response.headers.get("set-cookie")!.split(";")[0]!;
     return {
       csrfToken: (await response.json() as { csrfToken: string }).csrfToken,
-      cookie: response.headers.get("set-cookie")!.split(";")[0]!,
+      cookie: `${adminCookie}; ${csrfCookie}`,
     };
+  }
+
+  async function resetAdminSession(): Promise<void> {
+    const response = await admin.fetch("/api/auth/reset", {
+      method: "POST",
+      headers: {
+        "Cf-Access-Jwt-Assertion": await issueAccess(),
+        Origin: ORIGIN,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ newPassword: "Admin123!" }),
+    });
+    expect(response.status).toBe(200);
+    adminCookie = response.headers.get("Set-Cookie")!.split(";")[0]!;
   }
 
   async function adminMutation(path: string, method: string, body: object, csrfToken: string, cookie: string) {

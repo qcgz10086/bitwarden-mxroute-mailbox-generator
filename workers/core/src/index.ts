@@ -42,7 +42,11 @@ export class AdminEntrypoint extends WorkerEntrypoint<CoreEnv> {
   confirmMailbox(identity: AdminIdentity, publicId: string): Promise<{ requestId: string }> { return administration(this.env).confirmMailbox(identity, publicId); }
   isAdminPasswordSet(): Promise<boolean> { return administration(this.env).isAdminPasswordSet(); }
   verifyAdminPassword(password: string): Promise<boolean> { return administration(this.env).verifyAdminPassword(password); }
-  setAdminPassword(identity: AdminIdentity, newPassword: string): Promise<{ requestId: string }> { return administration(this.env).setAdminPassword(identity, newPassword); }
+  setAdminPassword(identity: AdminIdentity, newPassword: string): Promise<{ requestId: string; passwordVersion: number }> { return administration(this.env).setAdminPassword(identity, newPassword); }
+  getAdminPasswordVersion(): Promise<number> { return administration(this.env).getAdminPasswordVersion(); }
+  recordLoginFailure(key: string, nowIso: string): Promise<void> { return administration(this.env).recordLoginFailure(key, nowIso); }
+  isLoginBlocked(key: string, nowIso: string): Promise<boolean> { return administration(this.env).isLoginBlocked(key, nowIso); }
+  clearLoginFailures(key: string): Promise<void> { return administration(this.env).clearLoginFailures(key); }
   syncDomains(identity: AdminIdentity): Promise<readonly DomainRecord[]> { return administration(this.env).syncDomains(identity); }
   setDefaultDomain(identity: AdminIdentity, domain: string): Promise<{ requestId: string }> { return administration(this.env).setDefaultDomain(identity, domain); }
   createApiToken(identity: AdminIdentity, name: string, operationId: string): Promise<{ id: string; rawToken: string; requestId: string; expiresAt: string }> { return administration(this.env).createApiToken(identity, name, operationId); }

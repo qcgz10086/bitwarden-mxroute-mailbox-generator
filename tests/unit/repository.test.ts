@@ -27,6 +27,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await env.DB.batch([
+    env.DB.prepare("UPDATE mailboxes SET status = 'deleting', reservation_date = NULL, reservation_token_id = NULL"),
     env.DB.prepare("DELETE FROM mailboxes"),
     env.DB.prepare("DELETE FROM creation_counters"),
     env.DB.prepare("DELETE FROM api_tokens"),

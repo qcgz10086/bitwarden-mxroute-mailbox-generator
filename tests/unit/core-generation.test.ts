@@ -261,6 +261,8 @@ describe("MailboxService.generateMailbox", () => {
       email: `23456789abcd@${DOMAIN}`,
       quotaMb: 100,
       status: "registered",
+      reservationDate: "2026-08-13",
+      reservationTokenId: TOKEN_ID,
       failureCode: null,
       encryptionKeyVersion: null,
     });

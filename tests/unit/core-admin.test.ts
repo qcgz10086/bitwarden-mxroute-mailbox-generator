@@ -73,12 +73,16 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await env.DB.batch([
+    env.DB.prepare("UPDATE mailboxes SET status = 'deleting', reservation_date = NULL, reservation_token_id = NULL"),
     env.DB.prepare("DELETE FROM mailboxes"),
     env.DB.prepare("DELETE FROM creation_counters"),
     env.DB.prepare("DELETE FROM api_tokens"),
     env.DB.prepare("DELETE FROM audit_events"),
+    env.DB.prepare("DELETE FROM login_attempts"),
     env.DB.prepare("DELETE FROM domains"),
     env.DB.prepare("DELETE FROM settings WHERE key = ?").bind("default_domain"),
+    env.DB.prepare("DELETE FROM settings WHERE key = ?").bind("admin_password_hash"),
+    env.DB.prepare("UPDATE settings SET value = '0' WHERE key = 'admin_password_version'"),
     env.DB.prepare("UPDATE settings SET value = '100' WHERE key = 'mailbox_quota_mb'"),
     env.DB.prepare("UPDATE settings SET value = '12' WHERE key = 'prefix_length'"),
     env.DB.prepare("UPDATE settings SET value = '30' WHERE key = 'daily_creation_limit'"),
@@ -127,6 +131,36 @@ async function seedRegisteredMailbox(publicId = "mbx-1", email = EMAIL, status =
     ) VALUES(?, ?, 'alpha', ?, 100, ?, ?, ?)`)
     .bind(publicId, email, DOMAIN, status, STALE, updatedAt)
     .run();
+}
+
+async function seedReservedRegisteredMailbox(
+  publicId = "mbx-reserved",
+  email = EMAIL,
+  status: "registered" | "activating" | "failed" = "registered",
+  tokenId = "reservation-token",
+): Promise<void> {
+  await new Repository(env.DB).syncDomains([DOMAIN], STALE);
+  await new Repository(env.DB).createTokenDigest({
+    id: tokenId,
+    name: "Reservation",
+    digest: new Uint8Array([9, 9, 9, 9]),
+    createdAt: STALE,
+  });
+  await new Repository(env.DB).registerMailbox({
+    tokenId,
+    date: "2026-08-13",
+    publicId,
+    email,
+    localPart: "alpha",
+    domain: DOMAIN,
+    quotaMb: 100,
+    now: STALE,
+  });
+  if (status !== "registered") {
+    await env.DB.prepare("UPDATE mailboxes SET status = ?, updated_at = ? WHERE public_id = ?")
+      .bind(status, STALE, publicId)
+      .run();
+  }
 }
 
 async function expectAdminError(promise: Promise<unknown>, code: string): Promise<void> {
@@ -299,7 +333,9 @@ describe("AdministrationService password state machine", () => {
   it("sets, verifies, and rejects the admin password", async () => {
     const service = adminService();
     expect(await service.isAdminPasswordSet()).toBe(false);
-    await service.setAdminPassword(ADMIN, "CorrectHorse123");
+    const first = await service.setAdminPassword(ADMIN, "CorrectHorse123");
+    expect(first.passwordVersion).toBe(1);
+    expect(await service.getAdminPasswordVersion()).toBe(1);
     expect(await service.isAdminPasswordSet()).toBe(true);
     expect(await service.verifyAdminPassword("CorrectHorse123")).toBe(true);
     expect(await service.verifyAdminPassword("WrongPassword")).toBe(false);
@@ -342,7 +378,7 @@ describe("AdministrationService password state machine", () => {
     await expectAdminError(service.confirmMailbox(ADMIN, "mbx-1"), "INVALID_STATE");
   });
 
-  it.each(["MX_UNAUTHORIZED", "MX_CLIENT", "MX_CONFLICT"] as const)("marks an explicitly failed confirm as failed with %s", async (code) => {
+  it.each(["MX_UNAUTHORIZED", "MX_CLIENT"] as const)("marks an explicitly failed confirm as failed with %s", async (code) => {
     await seedRegisteredMailbox();
     const mxroute = new FakeMxroute();
     mxroute.createOutcomes.push(code);
@@ -354,16 +390,57 @@ describe("AdministrationService password state machine", () => {
     expect(audit?.result).toBe("failure");
   });
 
-  it("keeps an uncertain confirm in activating state for reconciliation", async () => {
+  it("activates a confirm conflict when MXroute already holds the matching mailbox", async () => {
     await seedRegisteredMailbox();
     const mxroute = new FakeMxroute();
-    mxroute.createOutcomes.push("MX_TIMEOUT");
+    mxroute.createOutcomes.push("MX_CONFLICT");
     const service = adminService(mxroute);
 
-    await expectAdminError(service.confirmMailbox(ADMIN, "mbx-1"), "MX_TIMEOUT");
+    await expect(service.confirmMailbox(ADMIN, "mbx-1")).resolves.toMatchObject({ requestId: expect.any(String) });
+
+    expect(mxroute.gets).toEqual([`alpha@${DOMAIN}`]);
+    expect((await new Repository(env.DB).findMailbox("mbx-1"))?.status).toBe("active");
+  });
+
+  it("marks a confirm conflict as failed when MXroute reports the mailbox missing", async () => {
+    await seedRegisteredMailbox();
+    const mxroute = new FakeMxroute();
+    mxroute.createOutcomes.push("MX_CONFLICT");
+    mxroute.getOutcomes.push("MX_NOT_FOUND");
+    const service = adminService(mxroute);
+
+    await expectAdminError(service.confirmMailbox(ADMIN, "mbx-1"), "MX_CONFLICT");
+    expect((await new Repository(env.DB).findMailbox("mbx-1"))?.status).toBe("failed");
+    const audit = await env.DB.prepare("SELECT result FROM audit_events WHERE action = 'mailbox.confirm'").first<{ result: string }>();
+    expect(audit?.result).toBe("failure");
+  });
+
+  it.each(["MX_TIMEOUT", "MX_INVALID_RESPONSE"] as const)("keeps an uncertain confirm in activating state for reconciliation with %s", async (code) => {
+    await seedRegisteredMailbox();
+    const mxroute = new FakeMxroute();
+    mxroute.createOutcomes.push(code);
+    const service = adminService(mxroute);
+
+    await expectAdminError(service.confirmMailbox(ADMIN, "mbx-1"), code);
     const mailbox = await new Repository(env.DB).findMailbox("mbx-1");
     expect(mailbox?.status).toBe("activating");
     expect(mailbox?.passwordCiphertext).not.toBeNull();
+  });
+
+  it("tracks login failures through the administration service and blocks after five attempts", async () => {
+    const service = adminService();
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await service.recordLoginFailure("global", NOW);
+      expect(await service.isLoginBlocked("global", NOW)).toBe(false);
+    }
+    await service.recordLoginFailure("global", NOW);
+    expect(await service.isLoginBlocked("global", NOW)).toBe(true);
+    const beforeExpiry = new Date(new Date(NOW).getTime() + 9 * 60_000).toISOString();
+    expect(await service.isLoginBlocked("global", beforeExpiry)).toBe(true);
+    const afterExpiry = new Date(new Date(NOW).getTime() + 10 * 60_000 + 1).toISOString();
+    expect(await service.isLoginBlocked("global", afterExpiry)).toBe(false);
+    await service.clearLoginFailures("global");
+    expect(await service.isLoginBlocked("global", NOW)).toBe(false);
   });
 
   it.each(["corrupt ciphertext", "missing key"])(
@@ -485,6 +562,49 @@ describe("AdministrationService permanent deletion and recovery", () => {
     const audit = await env.DB.prepare("SELECT * FROM audit_events WHERE action = 'mailbox.delete' AND result = 'success'").first<Record<string, unknown>>();
     expect(audit).toMatchObject({ result: "success", email: EMAIL, actor_email: ADMIN.email });
     expect(Object.keys(audit ?? {})).not.toContain("password_ciphertext");
+  });
+
+  it("locally deletes a registered mailbox and releases the daily quota without calling MXroute", async () => {
+    await seedReservedRegisteredMailbox();
+    const mxroute = new FakeMxroute();
+    const service = adminService(mxroute);
+
+    await service.deleteMailbox(ADMIN, "mbx-reserved", EMAIL);
+
+    expect(mxroute.deletes).toEqual([]);
+    expect(await new Repository(env.DB).findMailbox("mbx-reserved")).toBeNull();
+    const counter = await env.DB.prepare("SELECT count FROM creation_counters WHERE token_id = ?")
+      .bind("reservation-token").first<{ count: number }>();
+    expect(counter?.count).toBe(0);
+  });
+
+  it.each(["activating", "failed"] as const)("locally deletes a %s mailbox only when MXroute reports it missing", async (status) => {
+    await seedReservedRegisteredMailbox("mbx-reserved", EMAIL, status);
+    const mxroute = new FakeMxroute();
+    mxroute.getOutcomes.push("MX_NOT_FOUND");
+    const service = adminService(mxroute);
+
+    await service.deleteMailbox(ADMIN, "mbx-reserved", EMAIL);
+
+    expect(mxroute.gets).toEqual([`alpha@${DOMAIN}`]);
+    expect(mxroute.deletes).toEqual([]);
+    expect(await new Repository(env.DB).findMailbox("mbx-reserved")).toBeNull();
+    const counter = await env.DB.prepare("SELECT count FROM creation_counters WHERE token_id = ?")
+      .bind("reservation-token").first<{ count: number }>();
+    expect(counter?.count).toBe(0);
+  });
+
+  it("deletes an activating mailbox through MXroute when the account exists", async () => {
+    await seedMailbox("activating");
+    const mxroute = new FakeMxroute();
+    mxroute.getOutcomes.push("success");
+    const service = adminService(mxroute);
+
+    await service.deleteMailbox(ADMIN, "mbx-1", EMAIL);
+
+    expect(mxroute.gets).toEqual([`alpha@${DOMAIN}`]);
+    expect(mxroute.deletes).toEqual([`alpha@${DOMAIN}`]);
+    expect(await new Repository(env.DB).findMailbox("mbx-1")).toBeNull();
   });
 
   it("treats upstream NOT_FOUND as deletion success and explicit failure as visible delete_failed", async () => {
