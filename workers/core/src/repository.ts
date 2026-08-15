@@ -1014,6 +1014,14 @@ export class Repository {
     await auditStatement(this.db, event).run();
   }
 
+  async clearAuditEvents(event: AuditEventInput): Promise<void> {
+    const [, marker] = await this.db.batch([
+      this.db.prepare("DELETE FROM audit_events"),
+      auditStatement(this.db, event),
+    ]);
+    requireSingleChange(marker);
+  }
+
   async pageAudit(options: PageAuditOptions = {}): Promise<AuditPage> {
     const limit = validPageLimit(options.limit);
     let cursorClause = "";

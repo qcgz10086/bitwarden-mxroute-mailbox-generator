@@ -22,6 +22,12 @@ describe("admin UI i18n", () => {
     expect(t("navMailboxes")).toBe("Mailboxes");
     expect(tf("loadedMailboxes", { count: 3 })).toBe("Loaded 3 mailboxes.");
     expect(tf("passwordShown", { email: "a@b.c" })).toContain("a@b.c");
+    expect(t("btnClearAudit")).toBe("Clear audit");
+    expect(t("confirmClearAudit")).toContain("cannot be undone");
+    expect(t("auditCleared")).toBe("Audit log cleared.");
+    store.clear();
+    setLanguage("zh");
+    expect(t("btnClearAudit")).toBe("清空审计");
   });
 
   it("falls back to the key when a translation is missing", () => {

@@ -44,6 +44,7 @@ export interface AdminCore {
   acknowledgeApiToken(identity: AdminIdentity, id: string, operationId: string): Promise<{ requestId: string }>;
   revokeApiToken(identity: AdminIdentity, id: string): Promise<{ requestId: string }>;
   pageAudit(identity: AdminIdentity, options: PageAuditOptions): Promise<AuditPage>;
+  clearAudit(identity: AdminIdentity): Promise<{ requestId: string }>;
   isAdminPasswordSet(): Promise<boolean>;
   verifyAdminPassword(password: string): Promise<boolean>;
   setAdminPassword(identity: AdminIdentity, newPassword: string): Promise<{ requestId: string; passwordVersion: number }>;
@@ -277,7 +278,11 @@ async function route(request: Request, url: URL, method: string, identity: Admin
     return json(await core.revokeApiToken(identity, decodeId(match[1]!)));
   }
   if (path === "/api/audit") {
-    requireMethod(method, "GET"); return json(await core.pageAudit(identity, pageQuery(url)));
+    if (method === "GET") return json(await core.pageAudit(identity, pageQuery(url)));
+    requireMethod(method, "DELETE");
+    rejectQuery(url, new Set());
+    await readObject(request, new Set());
+    return json(await core.clearAudit(identity));
   }
   if (["GET", "POST", "PUT", "DELETE"].includes(method)) throw new HttpError(404, "NOT_FOUND");
   throw new HttpError(405, "METHOD_NOT_ALLOWED");
@@ -501,7 +506,7 @@ async function hmacKey(key: string, message: string): Promise<Uint8Array> {
     ["sign"],
   );
   const digest = await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(message));
-  return new Uint8Array(digest).slice(0, 16);
+  return new Uint8Array(digest);
 }
 
 function cookieValue(cookieHeader: string | null, name: string): string | null {

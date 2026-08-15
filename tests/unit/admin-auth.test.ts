@@ -69,6 +69,7 @@ function coreDouble() {
     acknowledgeApiToken: vi.fn(async () => ({ requestId: "r7" })),
     revokeApiToken: vi.fn(async () => ({ requestId: "r7" })),
     pageAudit: vi.fn(async () => ({ items: [], nextCursor: null })),
+    clearAudit: vi.fn(async () => ({ requestId: "r11" })),
     isAdminPasswordSet: vi.fn(async () => false),
     verifyAdminPassword: vi.fn(async () => false),
     setAdminPassword: vi.fn(async () => ({ requestId: "r10", passwordVersion: ++passwordVersion })),
@@ -169,6 +170,7 @@ describe("Admin worker", () => {
       ["/api/mailboxes/m1/confirm","POST",{},s.CORE.confirmMailbox],
       ["/api/tokens","POST",{ name:"phone", operationId:"operation-phone-0001" },s.CORE.createApiToken], ["/api/tokens/t1","DELETE",{},s.CORE.revokeApiToken],
       ["/api/tokens/t1/acknowledge","POST",{ operationId:"operation-phone-0001" },s.CORE.acknowledgeApiToken],
+      ["/api/audit","DELETE",{},s.CORE.clearAudit],
     ];
     for (const [path,method,body,spy] of cases) { const response=await mutate(s,path,method,body); expect(response.status).toBe(200); expect(spy).toHaveBeenCalled(); expect(response.headers.get("Cache-Control")).toBe("no-store"); }
     expect(s.CORE.deleteMailbox).toHaveBeenCalledWith(id,"m1"," a@example.com ");
@@ -181,6 +183,34 @@ describe("Admin worker", () => {
     expect(s.CORE.updateSettings).toHaveBeenCalledWith(id,{ mailboxQuotaMb:100 });
     expect(s.CORE.createApiToken).toHaveBeenCalledWith(id,"phone","operation-phone-0001");
     expect(s.CORE.revokeApiToken).toHaveBeenCalledWith(id,"t1");
+  });
+
+  it("clears the audit log only with session and CSRF while GET audit keeps working", async () => {
+    const s = setup();
+    const { cookie, csrf } = await session(s);
+    expect((await s.fetch(authRequest("/api/audit", { method: "DELETE", headers: { Origin: ORIGIN } }))).status).toBe(401);
+    expect(s.CORE.clearAudit).not.toHaveBeenCalled();
+    expect((await s.fetch(authRequest("/api/audit", { method: "DELETE", headers: { Origin: ORIGIN, Cookie: cookie } }))).status).toBe(403);
+    expect(s.CORE.clearAudit).not.toHaveBeenCalled();
+    const response = await s.fetch(authRequest("/api/audit", { method: "DELETE", headers: { Origin: ORIGIN, Cookie: cookie, "X-CSRF-Token": csrf, "Content-Type": "application/json" }, body: JSON.stringify({}) }));
+    expect(response.status).toBe(200);
+    expect(s.CORE.clearAudit).toHaveBeenCalledWith({ subject: expect.stringMatching(/^password-admin:v1:/), email: "password-admin@local" });
+    expect((await s.fetch(authRequest("/api/audit", { headers: { Cookie: cookie } }))).status).toBe(200);
+    expect(s.CORE.pageAudit).toHaveBeenCalled();
+  });
+
+  it("rejects cookies signed with the legacy 16-byte truncated HMAC", async () => {
+    const s = setup();
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey("raw", encoder.encode(SESSION_KEY), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const payload = { exp: Math.floor(Date.now() / 1_000) + 3_600, pwdVersion: 1, sid: "legacy-session" };
+    const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
+    const digest = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(encoded)));
+    const truncated = Buffer.from(digest.slice(0, 16)).toString("base64url");
+    expect(truncated.length).toBeLessThan(Buffer.from(digest).toString("base64url").length);
+    const response = await s.fetch(authRequest("/api/mailboxes", { headers: { Cookie: `admin_session=${encoded}.${truncated}` } }));
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "ADMIN_LOGIN_REQUIRED" });
   });
 
   it("gates the API behind a password session and issues one on valid login", async () => {

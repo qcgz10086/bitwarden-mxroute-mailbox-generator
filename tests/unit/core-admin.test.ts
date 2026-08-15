@@ -295,6 +295,32 @@ describe("AdministrationService configuration and tokens", () => {
       await expectAdminError(service.pageAudit(ADMIN, { limit }), "INVALID_INPUT");
     },
   );
+
+  it("clears all audit events and leaves exactly one audit.clear marker per clear", async () => {
+    await seedMailbox();
+    const service = adminService();
+    await service.setMailboxNote(ADMIN, "mbx-1", "note one");
+    await service.setMailboxNote(ADMIN, "mbx-1", "note two");
+    await service.revealPassword(ADMIN, "mbx-1");
+    const before = await env.DB.prepare("SELECT COUNT(*) count FROM audit_events").first<{ count: number }>();
+    expect(before?.count).toBeGreaterThanOrEqual(3);
+
+    const result = await service.clearAudit(ADMIN);
+    expect(result.requestId).toMatch(/^request-/);
+
+    const page = await service.pageAudit(ADMIN);
+    expect(page.items).toHaveLength(1);
+    expect(page.items[0]).toMatchObject({
+      actorType: "admin", actorId: ADMIN.subject, actorEmail: ADMIN.email,
+      action: "audit.clear", email: null, result: "success", errorCode: null,
+      requestId: result.requestId,
+    });
+
+    await service.clearAudit(ADMIN);
+    const second = await service.pageAudit(ADMIN);
+    expect(second.items).toHaveLength(1);
+    expect(second.items[0]).toMatchObject({ action: "audit.clear" });
+  });
 });
 
 describe("AdministrationService password state machine", () => {
@@ -636,6 +662,25 @@ describe("AdministrationService permanent deletion and recovery", () => {
     exists.deleteOutcomes.push("MX_TIMEOUT");
     await expectAdminError(adminService(exists).deleteMailbox(ADMIN, "mbx-1", EMAIL), "MX_TIMEOUT");
     expect((await new Repository(env.DB).findMailbox("mbx-1"))?.status).toBe("delete_failed");
+  });
+
+  it("records an activating recovery attempt against activating, not pending", async () => {
+    await seedMailbox("activating");
+    const repository = new Repository(env.DB);
+    const attempts = vi.spyOn(repository, "recordRecoveryAttempt");
+    const mxroute = new FakeMxroute();
+    mxroute.getOutcomes.push("MX_TIMEOUT");
+    const service = new AdministrationService({
+      repository, mxroute, tokenPepper: TOKEN_PEPPER,
+      encryptionKeys: { 1: ENCRYPTION_KEY }, encryptionKeyVersion: 1,
+      now: () => new Date(NOW), createId: (kind) => `${kind}-${crypto.randomUUID()}`,
+    });
+
+    await service.reconcileAll();
+
+    expect(attempts).toHaveBeenCalledTimes(1);
+    expect(attempts).toHaveBeenCalledWith("mbx-1", "activating", NOW);
+    expect((await repository.findMailbox("mbx-1"))?.recoveryAttemptCount).toBe(1);
   });
 
   it("reconciles at most 25 stale pending rows and stops rows after eight attempts", async () => {

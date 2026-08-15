@@ -462,6 +462,57 @@ describe("D1 repository", () => {
     });
   });
 
+  it("clears every audit row and keeps only the audit.clear marker", async () => {
+    const repository = new Repository(env.DB);
+    for (const id of ["audit_01", "audit_02", "audit_03"]) {
+      await repository.appendAudit({
+        id,
+        actorType: "admin",
+        actorId: "admin@example.test",
+        action: "mailbox.reveal",
+        email: `alpha@${DOMAIN}`,
+        result: "success",
+        errorCode: null,
+        requestId: `request_${id}`,
+        createdAt: NOW,
+      });
+    }
+
+    await repository.clearAuditEvents({
+      id: "audit_clear",
+      actorType: "admin",
+      actorId: "admin@example.test",
+      action: "audit.clear",
+      email: null,
+      result: "success",
+      errorCode: null,
+      requestId: "request_clear",
+      createdAt: LATER,
+    });
+
+    const rows = await env.DB.prepare("SELECT id, action FROM audit_events").all<{ id: string; action: string }>();
+    expect(rows.results).toEqual([{ id: "audit_clear", action: "audit.clear" }]);
+    const page = await repository.pageAudit();
+    expect(page.items).toHaveLength(1);
+    expect(page.items[0]).toMatchObject({ action: "audit.clear", requestId: "request_clear" });
+    expect(page.nextCursor).toBeNull();
+
+    await repository.clearAuditEvents({
+      id: "audit_clear_again",
+      actorType: "admin",
+      actorId: "admin@example.test",
+      action: "audit.clear",
+      email: null,
+      result: "success",
+      errorCode: null,
+      requestId: "request_clear_again",
+      createdAt: LATER,
+    });
+    const second = await repository.pageAudit();
+    expect(second.items).toHaveLength(1);
+    expect(second.items[0]).toMatchObject({ action: "audit.clear" });
+  });
+
   it("keeps a pending mailbox unchanged when its atomic activation audit fails", async () => {
     const repository = new Repository(env.DB);
     await prepareReservation(repository);

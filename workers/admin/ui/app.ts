@@ -442,6 +442,10 @@ function bind(): void {
   byId("delete-form").addEventListener("submit", (event: { preventDefault(): void }) => { event.preventDefault(); const input = byId<HTMLInputElement>("delete-confirmation"); void performExactDelete(input.dataset.id ?? "", input.dataset.email ?? "", input.value, (path, method, body) => api.mutate(path, method, body), () => byId<HTMLDialogElement>("delete-dialog").close()).then(async (deleted) => { if (!deleted) return status(t("typeExactEmail")); await loadMailboxes(); await loadRecovery(); status(t("mailboxDeleted")); }).catch(fail); });
   const refreshButton = byId<HTMLButtonElement>("refresh-recovery"); const moreButton = byId<HTMLButtonElement>("recovery-more");
   byId("cancel-delete").addEventListener("click", () => byId<HTMLDialogElement>("delete-dialog").close()); byId("audit-next").addEventListener("click", () => { if (auditCursor) void loadAudit(auditCursor).catch(fail); });
+  byId("audit-clear").addEventListener("click", () => {
+    if (!confirm(t("confirmClearAudit"))) return;
+    void api.mutate("/api/audit", "DELETE").then(async () => { await loadAudit(); status(t("auditCleared")); }).catch(fail);
+  });
   refreshButton.addEventListener("click", () => void runDisabled(refreshButton, async () => { moreButton.disabled = true; await recoveryPager.refresh(); renderRecovery(); }).catch(fail));
   moreButton.addEventListener("click", () => void runDisabled(moreButton, async () => { refreshButton.disabled = true; try { await loadMoreRecovery(); } finally { refreshButton.disabled = false; } }).then(() => renderRecovery()).catch(fail));
   bindSensitiveLifecycleEvents({ visibility: document, navigation: window, tokenDialog: { addEventListener: () => undefined }, isHidden: () => document.hidden }, concealAllMailboxSecrets, () => { tokenWorkflow.pagehide(); void tokenWorkflow.compensation(); });

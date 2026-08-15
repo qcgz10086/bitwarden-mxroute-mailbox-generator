@@ -239,6 +239,12 @@ export class AdministrationService {
     catch (error) { throw new AdminError(repositoryAdminCode(error), this.createId("request")); }
   }
 
+  clearAudit(identity: AdminIdentity): Promise<{ requestId: string }> {
+    return this.adminMutation(identity, "audit.clear", null, async (event) => {
+      await this.dependencies.repository.clearAuditEvents(event);
+    });
+  }
+
   async listDomains(_identity: AdminIdentity): Promise<readonly import("./repository").DomainRecord[]> {
     try { return await this.dependencies.repository.listDomains(); }
     catch { throw new AdminError("INTERNAL_ERROR", this.createId("request")); }
@@ -704,7 +710,7 @@ export class AdministrationService {
             await this.dependencies.repository.failPendingMailboxWithAudit(mailbox.publicId,"MX_NOT_FOUND",now,
               this.systemAudit("mailbox.create.reconcile",mailbox.email,"failure","MX_NOT_FOUND",now));
           } else {
-            await this.dependencies.repository.recordRecoveryAttempt(mailbox.publicId, "pending", now);
+            await this.dependencies.repository.recordRecoveryAttempt(mailbox.publicId, mailbox.status, now);
           }
         } else if (mailbox.status === "reset_unknown" || mailbox.status === "resetting") {
           const password = await this.decrypt(mailbox, true, this.createId("request"));

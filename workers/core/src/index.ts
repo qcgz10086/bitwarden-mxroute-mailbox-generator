@@ -57,6 +57,7 @@ export class AdminEntrypoint extends WorkerEntrypoint<CoreEnv> {
     return { ...await new Repository(this.env.DB).getSettings(), requestId: result.requestId };
   }
   pageAudit(identity: AdminIdentity, options: PageAuditOptions = {}): Promise<AuditPage> { return administration(this.env).pageAudit(identity, options); }
+  clearAudit(identity: AdminIdentity): Promise<{ requestId: string }> { return administration(this.env).clearAudit(identity); }
 }
 
 export default class ScheduledEntrypoint extends WorkerEntrypoint<CoreEnv> {
