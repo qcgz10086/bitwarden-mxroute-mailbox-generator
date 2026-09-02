@@ -175,7 +175,12 @@ npx wrangler deploy --dry-run --config .wrangler/environments/staging/admin.json
 
 如果本机存在 `Cloudflare API.txt` 或 `MXroute Email Hosting API.txt`，它们只允许留在本地：不要打印、解析、上传或提交。`.gitignore` 已对这两个精确文件名提供额外保护；部署脚本也不会自动读取它们，所有 Secret 仍通过受保护的交互输入或本机密码学随机数进入 Wrangler stdin。
 
-### AI 部署\n\n把下面整段提示词复制给能跑本机终端的助手（Cursor、Claude Code 等），填好变量后让它执行。MXroute 密钥不要贴进聊天，用脚本交互输入。同一份也在 [docs/ai-deploy-prompt.md](docs/ai-deploy-prompt.md)。\n\n```text\n你是本仓库的部署助手。仓库：bitwarden-mxroute-mailbox-generator。只做 Cloudflare Workers 部署，不要改应用代码、不要开 PR 改业务逻辑、不要打印或提交任何密钥。
+### AI 部署
+
+把下面整段提示词复制给能跑本机终端的助手（Cursor、Claude Code 等），填好变量后让它执行。MXroute 密钥不要贴进聊天，用脚本交互输入。同一份也在 [docs/ai-deploy-prompt.md](docs/ai-deploy-prompt.md)。
+
+```text
+你是本仓库的部署助手。仓库：bitwarden-mxroute-mailbox-generator。只做 Cloudflare Workers 部署，不要改应用代码、不要开 PR 改业务逻辑、不要打印或提交任何密钥。
 
 先读 README.md 的「用脚本部署」和 docs/operations.md。上线只用这两个脚本：
 - scripts/bootstrap-cloudflare.ps1
@@ -208,7 +213,10 @@ npx wrangler deploy --dry-run --config .wrangler/environments/staging/admin.json
 5. 运行 bootstrap 脚本 Phase Finalize：先 WhatIf。再对 .wrangler/environments 下该环境的三份 jsonc 做 dry-run。通过后再 Finalize Confirm。
 6. 完成后只汇报 Worker 名称、主机名、请求是否成功，不要输出 Secret 或 Token。提醒操作者去 Admin 同步域名、开生成、签发 Bitwarden Token。
 
-参数格式以脚本校验为准：AccessTeamDomain 必须是 https 的 cloudflareaccess.com Team Domain；AdminOrigin 必须与 AdminHostname 精确对应。命令示例见 README「命令示例」。生产把 Environment 换成 production。\n```\n\n## 使用
+参数格式以脚本校验为准：AccessTeamDomain 必须是 https 的 cloudflareaccess.com Team Domain；AdminOrigin 必须与 AdminHostname 精确对应。命令示例见 README「命令示例」。生产把 Environment 换成 production。
+```
+
+## 使用
 
 ### 管理端
 
