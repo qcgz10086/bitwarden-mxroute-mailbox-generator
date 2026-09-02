@@ -1,37 +1,46 @@
-# Bitwarden MXroute 独立邮箱生成器
+# Bitwarden × MXroute 独立邮箱生成器
 
-这是一个运行在 **Cloudflare Workers**（不是“workspage”）上的三 Worker 服务：Bitwarden 桌面端和手机端通过 SimpleLogin 兼容接口创建真实 MXroute 独立邮箱；管理页受 Cloudflare Access 登录保护。
+本项目**不修改** Bitwarden。操作者在 Bitwarden 的「用户名生成器 → 转发邮箱别名 → SimpleLogin」中，把 Server URL 指向自己部署的 Generator，用管理页签发的 Token 当 API Key；每次生成会在操作者自己的 **MXroute 域名**上创建一封真实独立邮箱。**邮箱密码永远不会进入 Bitwarden**；查看与重置只在管理界面完成。
 
-- 邮箱前缀：12 位纯随机串，例如 `q8v2ka7m3wc@example.com`
-- 邮箱密码：每个邮箱独立生成，严格 18 位；只以 AES-256-GCM 密文存入 D1
-- 默认容量：100 MB，可在管理页调整后影响新邮箱
-- 多域名：从 MXroute 同步，在管理页选择一个默认域名
-- 删除：只有永久删除，没有单邮箱停用
-- Bitwarden：只得到邮箱地址，不得到邮箱密码
+适用：已有 MXroute、Cloudflare、自托管/小团队 Bitwarden 的运维人员。
+**不是**批量注册/滥用工具，**不是**完整 SimpleLogin，**不是**网页邮箱，**不是**官方 Bitwarden 插件。
+
+## 功能
+
+- Bitwarden SimpleLogin 兼容接口：`POST /api/alias/random/new`（另有 `OPTIONS` 与 `GET /healthz`）。
+- 本地部分：12 位随机字符；每个邮箱独立 18 位密码；默认容量 100 MB。
+- 三个 Worker：公网 **Generator**、无公网路由的私有 **Core**、**Admin** 管理页。
+- 双语管理页：同步域名、配额与默认域、生成总开关、Token 签发/撤销、显示/重置密码、永久删除、审计。
+- 邮箱密码以 AES-256-GCM 存入 D1；Bitwarden Token 为加 pepper 的 HMAC，明文只显示一次。
+- 删除只有永久删除，没有单邮箱停用。
 
 ## 架构
 
 ```text
-Bitwarden -> Generator Worker -> Core Worker -> MXroute / D1
-Browser   -> Access -> Admin Worker -> Core Worker
+Bitwarden  -->  Generator（公网，Token，限流，CORS）
+                  -->  Core GeneratorEntrypoint  -->  MXroute / D1
+
+Browser    -->  Admin（日常为管理员密码会话）
+                  -->  Core AdminEntrypoint
 ```
 
-Security note: Core exposes separate least-privilege RPC surfaces. Generator binds only to
-`GeneratorEntrypoint`, Admin binds only to `AdminEntrypoint`, and the default export only runs
-scheduled recovery. Do not remove the `services[].entrypoint` selectors.
+Cloudflare Access 用于管理端**密码重置相关身份路径**（以及建议作为 Admin 主机名的边缘保护）。细节见 [docs/operations.md](docs/operations.md)。
 
-API-token issuance is two phase. The browser reuses a client operation ID after a lost response;
-Core retains the pending raw token only as AES-GCM ciphertext for ten minutes. Copying or explicitly
-accepting it acknowledges the token, atomically erases the ciphertext, and activates authentication.
-Acknowledgement is idempotent for the same Access subject, token ID, and operation ID, so a lost ACK
-response can be retried without recovering or retaining the raw token. The management table labels
-each credential as Pending (with expiry), Active, or Revoked.
-Unacknowledged tokens cannot authenticate and cron revokes expired pending records. A known token ID
-is revoked with a same-origin keepalive request during page unload.
+仓库里的 `workers/*/wrangler.jsonc` 只是**本地测试模板**。真实环境配置写在被 Git 忽略的 `.wrangler/environments/<env>/`。
 
-Generator 和 Admin 只有 Core 服务绑定；D1、MXroute 凭据、Token pepper 和 AES 密钥仅存在于无公网路由的 Core。Admin Worker 还会自行验证 Access JWT、允许的邮箱、Origin 和双提交 CSRF。
+安全边界：Generator 只绑定 `GeneratorEntrypoint`，Admin 只绑定 `AdminEntrypoint`；Core 默认导出仅跑定时恢复。不要去掉 `services[].entrypoint` 选择器。Generator / Admin 没有 D1、MXroute 凭据、pepper 或 AES 密钥。
 
-## 本地验证
+## 要求
+
+- Node.js 22+
+- PowerShell 7+
+- Wrangler（已登录目标 Cloudflare 账户）
+- MXroute 凭据与至少一个已配置域名
+- 两个 HTTPS 主机名（Generator 与 Admin）
+
+完整部署、Access、轮换、恢复与预发布烟测见 **[docs/operations.md](docs/operations.md)**。
+
+## 快速开始（本地校验）
 
 要求 Node.js 22 或更新版本：
 
@@ -47,7 +56,45 @@ npx wrangler deploy --dry-run --config workers/admin/wrangler.jsonc
 
 上面三条只验证仓库内本地测试模板能够打包，不认证 Prepare 配置，也不能作为实际环境的上线门禁。实际部署必须按下述顺序对 Finalize `-WhatIf` 生成的环境配置重新执行全部三条 dry-run。
 
-完整的 Cloudflare 初始化、Access、Bitwarden 配置、轮换、恢复和真实预发布验收步骤见 [docs/operations.md](docs/operations.md)。脚本支持 `-WhatIf`，先预览：
+完整的 Cloudflare 初始化、Access、Bitwarden 配置、轮换、恢复和真实预发布验收步骤见 [docs/operations.md](docs/operations.md)。
+
+## 配置与密钥
+
+### Secrets（`scripts/set-secrets.ps1`）
+
+不要使用 Wrangler 的 `--value` 方式写入 Secret。脚本把值送进 Wrangler stdin；输出只显示名称和 `SET`/`PRESENT`。
+
+| Secret | 写入目标 | 来源 |
+|---|---|---|
+| `MXROUTE_SERVER` | Core | 受保护的交互输入 |
+| `MXROUTE_USERNAME` | Core | 受保护的交互输入 |
+| `MXROUTE_API_KEY` | Core | 受保护的交互输入 |
+| `TOKEN_PEPPER` | Core | 本机 CSPRNG（32 字节） |
+| `ENC_KEY_V1` | Core | 本机 CSPRNG（32 字节）；**不要覆盖或删除** |
+| `ADMIN_SESSION_KEY` | **Admin Worker** | 若 Admin 尚无此 Secret，脚本生成 256-bit 随机值并写入 Admin |
+
+已有生成密钥不会被覆盖。`-RotateMxroute` **只**轮换三项 MXroute 值。`set-secrets.ps1` **会**在 Admin 缺少 `ADMIN_SESSION_KEY` 时为其生成并设置；不是「只写 Core 的五项 Secret」。
+
+### Admin 非 Secret 变量（Finalize 写入）
+
+- `ACCESS_TEAM_DOMAIN`：完整 Team Domain，例如 `https://team.cloudflareaccess.com`，无路径。
+- `ACCESS_AUD`：Access 应用 AUD tag。
+- `ADMIN_EMAILS`：允许的管理员邮箱，逗号分隔。
+- `ADMIN_ORIGIN`：Admin 精确 origin，无结尾 `/`。
+
+可选 Turnstile：`TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY`。缺少 `ADMIN_SESSION_KEY` 时 Admin 返回 `SERVER_MISCONFIGURED`。
+
+日常管理登录是**管理员密码会话**，不是每个请求都验 Access JWT。Access JWT 用于 `/reset` 与 `/api/auth/reset`，并建议作为 Admin 主机名的边缘保护。
+
+### Bindings
+
+- **Generator**：`CORE` 指向 `GeneratorEntrypoint`；`PREAUTH_RATE_LIMITER` 30/60s；`TOKEN_RATE_LIMITER` 5/60s。
+- **Admin**：`CORE` 指向 `AdminEntrypoint`；`ASSETS`；四项 vars；Secret `ADMIN_SESSION_KEY`。
+- **Core**：`DB` + 五项 Core Secret；`workers_dev=false`；无公网 `routes`；cron `*/5 * * * *`。
+
+## 部署（预发布示例）
+
+脚本支持 `-WhatIf`，先预览：
 
 ```powershell
 $accountId = '0123456789abcdef0123456789abcdef'
@@ -78,3 +125,36 @@ npx wrangler deploy --dry-run --config .wrangler/environments/staging/admin.json
 不要提交 `.dev.vars`、`.env`、Wrangler 状态目录或生成的环境配置。真实部署和桌面/手机烟测需要操作者登录 Cloudflare、MXroute 和 Bitwarden 后完成；本仓库的本地测试不会执行这些外部变更。
 
 如果本机存在 `Cloudflare API.txt` 或 `MXroute Email Hosting API.txt`，它们只允许留在本地：不要打印、解析、上传或提交。`.gitignore` 已对这两个精确文件名提供额外保护；部署脚本也不会自动读取它们，所有 Secret 仍通过受保护的交互输入或本机密码学随机数进入 Wrangler stdin。
+
+## 使用
+
+### 管理端
+
+登录 Admin 后：同步域名 → 选默认域名 → 按需调整新邮箱容量（默认 100 MB）→ 打开「允许生成」→ 创建 Bitwarden Token。原始 Token **只显示一次**，立刻存进 Bitwarden。最多约两个有效 Token 便于轮换。签发是两阶段（Pending 约 10 分钟，确认后才可鉴权）。
+
+### Bitwarden
+
+用户名生成器 → 转发邮箱别名 → SimpleLogin：
+
+- **Server URL**：Generator 的 HTTPS origin（不要填 Admin / Core）
+- **API Key**：管理页展示过一次的原始 Token
+
+请求 Header 是 `Authentication`。查询参数 `hostname` / `mode` **会被忽略**。公开路径仅 `GET /healthz` 和 `POST` / `OPTIONS` `/api/alias/random/new`。
+
+## 安全说明
+
+- 不要去掉 `services[].entrypoint`；Generator / Admin 不绑定 D1，也不持有 MXroute / pepper / `ENC_KEY_V1`
+- Admin：密码会话、Origin 校验、双提交 CSRF；重置路径校验 Access JWT 与允许邮箱
+- 日志不要写明文密码、原始 Token、MXroute Key、完整认证头
+- 丢失 `ENC_KEY_V1` 则对应密文不可恢复；丢失 `TOKEN_PEPPER` 则现有 Token 全部失效
+- Bitwarden 无创建幂等键：成功响应丢失后再点一次可能再建一个邮箱
+
+紧急停生成：管理页关掉生成开关。不要为了急救删除 D1 / Core / 密钥 / 上游邮箱。
+
+## 免责声明
+
+- 与 Bitwarden、MXroute、Cloudflare、SimpleLogin **无官方关系**
+- 仓库 **未声明开源许可证**
+- 仅用于你拥有或被明确授权的域名与邮件账户；须遵守上游条款与当地法律
+
+完整运维、轮换、灾难恢复：[docs/operations.md](docs/operations.md)。
