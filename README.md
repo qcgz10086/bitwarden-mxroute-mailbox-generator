@@ -40,6 +40,14 @@ Cloudflare Access 用于管理端**密码重置相关身份路径**（以及建�
 
 完整部署、Access、轮换、恢复与预发布烟测见 **[docs/operations.md](docs/operations.md)**。
 
+## 部署到 Cloudflare
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/qcgz10086/bitwarden-mxroute-mailbox-generator)
+
+官方 [Deploy to Cloudflare](https://developers.cloudflare.com/workers/platform/deploy-buttons/) 按钮会把本仓库 fork 到你的 GitHub，并用 Workers Builds 尝试构建。**它不能一次部署整套服务**：本仓库是三个 Worker（公网 Generator、无公网 Core、Admin）加 D1 / Access 的 monorepo，官方明确不支持把多个 Worker 一起发出去。点下去最多完成 fork 和部分资源创建，**不能**替代下面的 Prepare / set-secrets / Finalize，也不要指望 Core 被绑到 `workers.dev`。
+
+生产请用本文的部署脚本和 [docs/operations.md](docs/operations.md)。
+
 ## 快速开始（本地校验）
 
 要求 Node.js 22 或更新版本：
