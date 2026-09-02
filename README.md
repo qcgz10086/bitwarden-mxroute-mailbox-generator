@@ -40,14 +40,6 @@ Cloudflare Access 用于管理端**密码重置相关身份路径**（以及建�
 
 完整部署、Access、轮换、恢复与预发布烟测见 **[docs/operations.md](docs/operations.md)**。
 
-## 部署到 Cloudflare
-
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/qcgz10086/bitwarden-mxroute-mailbox-generator)
-
-官方 [Deploy to Cloudflare](https://developers.cloudflare.com/workers/platform/deploy-buttons/) 按钮会把本仓库 fork 到你的 GitHub，并用 Workers Builds 尝试构建。**它不能一次部署整套服务**：本仓库是三个 Worker（公网 Generator、无公网 Core、Admin）加 D1 / Access 的 monorepo，官方明确不支持把多个 Worker 一起发出去。点下去最多完成 fork 和部分资源创建，**不能**替代下面的 Prepare / set-secrets / Finalize，也不要指望 Core 被绑到 `workers.dev`。
-
-生产请用本文的部署脚本和 [docs/operations.md](docs/operations.md)。
-
 ## 快速开始（本地校验）
 
 要求 Node.js 22 或更新版本：
@@ -100,13 +92,62 @@ npx wrangler deploy --dry-run --config workers/admin/wrangler.jsonc
 - **Admin**：`CORE` 指向 `AdminEntrypoint`；`ASSETS`；四项 vars；Secret `ADMIN_SESSION_KEY`。
 - **Core**：`DB` + 五项 Core Secret；`workers_dev=false`；无公网 `routes`；cron `*/5 * * * *`。
 
-## 部署（预发布示例）
+## 用脚本部署
+
+没有 Cloudflare 一键部署。上线只用这两个 PowerShell 7 脚本（先 `-WhatIf` 预览，再 `-Confirm` 改远程）：
+
+| 脚本 | 作用 |
+|---|---|
+| `scripts/bootstrap-cloudflare.ps1` | `-Phase Prepare` 建 D1 和无私网 Core shell；`-Phase Finalize` 写最终配置、跑迁移、发布三个 Worker 和自定义域名 |
+| `scripts/set-secrets.ps1` | 交互写入 Core 的 MXroute 三项；本机生成 `TOKEN_PEPPER` / `ENC_KEY_V1`（已有不覆盖）；Admin 缺少 `ADMIN_SESSION_KEY` 时生成并写入 Admin |
+
+不要把仓库里的 workers/*/wrangler.jsonc 当生产配置。脚本只读写 Git 忽略的 .wrangler/environments 目录。
+
+### 参数
+
+| 参数 | 值 |
+|---|---|
+| `-Environment` | 只能是 `staging` 或 `production` |
+| `-AccountId` | Cloudflare 仪表板 32 位 hex，且必须出现在 wrangler whoami 输出里 |
+| `-Profile` | 可选，Wrangler 配置名 |
+| `-Phase` | 仅 bootstrap：`Prepare`（默认）或 `Finalize` |
+| `-RotateMxroute` | 仅 set-secrets：只轮换三项 MXroute |
+
+Finalize 还要（脚本会校验格式）：
+
+| 参数 | 约束 |
+|---|---|
+| `-AccessTeamDomain` | https Team Domain，形如 team.cloudflareaccess.com，不要路径 |
+| `-AccessAud` | Access 应用 AUD |
+| `-AdminEmails` | 逗号分隔邮箱 |
+| `-AdminOrigin` | 精确 HTTPS origin，无路径、无结尾斜杠 |
+| `-GeneratorHostname` | 小写 DNS 主机名 |
+| `-AdminHostname` | 小写 DNS；AdminOrigin 必须等于 https:// 加上该主机名 |
+
+预发布名称：bitwarden-mxroute-core-staging、generator-staging、admin-staging，D1 bitwarden-mxroute-staging。生产去掉 -staging，D1 为 bitwarden-mxroute-production。
+
+### 逐步操作（预发布）
+
+在仓库根目录用 PowerShell 7。
+
+1. 进入 pwsh，安装依赖并登录 Wrangler，把仪表板里的 32 位 Account ID 赋给变量 accountId。
+2. Prepare：先 WhatIf 再 Confirm。只建 D1 和无私网 Core shell（此时无计划任务、无公网路由）。
+3. 跑 set-secrets.ps1：提示时输入三项 MXroute；pepper、AES、Admin 会话密钥由脚本生成。不要把 Secret 写在命令行参数里。
+4. 在 Zero Trust 为 Admin 主机名建 Self-hosted Access（保护整站，开 MFA，允许列表与 ADMIN_EMAILS 一致），复制 Team Domain 和 AUD。
+5. Finalize 先 WhatIf（只生成最终 jsonc），再对生成配置做 dry-run，通过后把同一条 Finalize 改成 Confirm。
+6. 生产：Environment 改成 production，配置目录和主机名换成生产值。
+
+下面是对应命令。完整清单、轮换和回滚见 [docs/operations.md](docs/operations.md)。
+
+### 命令示例
 
 脚本支持 `-WhatIf`，先预览：
 
 ```powershell
 $accountId = '0123456789abcdef0123456789abcdef'
+.\scripts\bootstrap-cloudflare.ps1 -Environment staging -AccountId $accountId -Phase Prepare -WhatIf
 .\scripts\bootstrap-cloudflare.ps1 -Environment staging -AccountId $accountId -Phase Prepare -Confirm
+.\scripts\set-secrets.ps1 -Environment staging -AccountId $accountId -WhatIf
 .\scripts\set-secrets.ps1 -Environment staging -AccountId $accountId -Confirm
 ```
 
