@@ -39,7 +39,7 @@ Secret 不作为参数出现，也不写入命令历史、文件或脚本输出�
 .\scripts\set-secrets.ps1 -Environment staging -AccountId $accountId -Profile personal -Confirm
 ```
 
-脚本对 `MXROUTE_SERVER`、`MXROUTE_USERNAME`、`MXROUTE_API_KEY` 使用受保护的交互输入；`TOKEN_PEPPER` 和 `ENC_KEY_V1` 在本机用 `RandomNumberGenerator.Fill` 生成 32 字节随机值，并直接送入 `wrangler secret put` 的标准输入。Wrangler 输出被丢弃，只显示 Secret 名称和 `SET`/`PRESENT`。已有生成密钥不会被覆盖；`-RotateMxroute` 只轮换三项 MXroute 值。
+脚本对 `MXROUTE_SERVER`、`MXROUTE_USERNAME`、`MXROUTE_API_KEY` 使用受保护的交互输入；`TOKEN_PEPPER` 和 `ENC_KEY_V1` 在本机用 `RandomNumberGenerator.Fill` 生成 32 字节随机值，并直接送入 Core 的 `wrangler secret put` 标准输入。若 Admin 尚未设置 `ADMIN_SESSION_KEY`，脚本同样生成本机随机值并写入 Admin Worker。Wrangler 输出被丢弃，只显示 Secret 名称和 `SET`/`PRESENT`。已有生成密钥不会被覆盖；`-RotateMxroute` 只轮换三项 MXroute 值。
 
 脚本要求 Prepare 创建的 Core shell 已存在；`secret list` 失败时立即停止，不会把 Secret 内容送进一个确认提示。每次写入前再次验证 Account ID、环境生成配置、Worker 名称、D1 和服务绑定。不要跳过 Prepare，也不要手工用 `--value` 设置 Secret。
 
@@ -52,11 +52,13 @@ Admin 运行时必须有以下非 Secret 变量：
 - `ADMIN_EMAILS`：允许的管理员邮箱，逗号分隔。
 - `ADMIN_ORIGIN`：Admin 的精确 origin，例如 `https://mail-admin.example.com`，不能有结尾 `/`。
 
+日常管理登录是密码会话，不是每个请求都验 Access JWT。set-secrets.ps1 会在 Admin Worker 上生成 ADMIN_SESSION_KEY（已存在则不覆盖）；未配置时管理端返回 SERVER_MISCONFIGURED。可选 Turnstile：TURNSTILE_SITE_KEY、TURNSTILE_SECRET_KEY。Access JWT 用于管理密码重置路径（/reset、/api/auth/reset），并建议作为 Admin 主机名的边缘保护。
+
 这些值由 Finalize 参数写入被忽略的环境 Admin 配置；它们不是密码，但仍要经过变更审查。确认：
 
 - Core 配置只有 `DB` 和五项 Secret，`workers_dev` 为 `false`，没有 `routes`。
 - Generator 只有 `CORE`、`PREAUTH_RATE_LIMITER`（30/60 秒）和 `TOKEN_RATE_LIMITER`（5/60 秒）。
-- Admin 只有 `CORE`、`ASSETS` 和上述四项变量。
+- Admin 有 `CORE`、`ASSETS`、上述四项变量，以及 Secret `ADMIN_SESSION_KEY`。
 - Generator/Admin 的 `CORE` 指向同一环境的 Core。
 
 ### 2.4 创建 Access，生成最终配置并做 dry-run，再发布
@@ -90,8 +92,8 @@ Dry-run binding gate: Generator must select `GeneratorEntrypoint`; Admin must se
 `AdminEntrypoint`. Missing or swapped `services[].entrypoint` values are a release blocker. Core's
 default export is scheduled-recovery only. Pending API-token issuance is encrypted and expires after
 ten minutes; the five-minute cron must remain enabled so abandoned, unacknowledged tokens are revoked.
-Apply migrations through `0004.sql` before deploying this version. ACK retries are deliberately
-idempotent only for the original Access subject plus token/operation IDs; the first successful ACK
+Apply migrations through `0007.sql` before deploying this version. ACK retries are deliberately
+idempotent only for the original admin password-session subject plus token/operation IDs (not the Access email); the first successful ACK
 deletes pending ciphertext and writes the single success audit event.
 
 逐项检查 dry-run 的绑定输出：Core 只有目标环境 D1；Generator 只有同环境 Core 和两个 Rate Limiter；Admin 只有同环境 Core、Assets 及四项预期 vars。Wrangler dry-run 不一定打印 cron/route，因此还要直接检查最终 `core.jsonc`：含 `*/5 * * * *`，`workers_dev=false`，没有 `routes`；所有配置中的 `account_id`、Worker 名称、D1 名称/ID和主机名必须与 WhatIf 摘要一致。检查通过后才运行相同的 Finalize 命令并使用 `-Confirm`：
@@ -112,7 +114,7 @@ Finalize 再次验证远程 D1 ID和五项 Core Secret，之后按顺序应用�
 2. 建立只允许指定管理员身份的 Allow policy；要求身份提供商 MFA。建议会话 15–30 分钟。
 3. 从应用复制 AUD tag 到 `ACCESS_AUD`；Team Domain 填入 `ACCESS_TEAM_DOMAIN`。
 4. `ADMIN_EMAILS` 与 Allow policy 使用同一组规范化邮箱；`ADMIN_ORIGIN` 与浏览器地址栏 origin 完全一致。
-5. 用未登录/无权限的浏览器确认请求在到达 Worker 前被 Access 拦截；再登录确认管理页可用。Access 是第一层，Admin Worker 的 JWT/邮箱验证是第二层。
+5. 用未登录/无权限的浏览器确认：若已把 Access 配在 Admin 主机名上，请求应在到达 Worker 前被拦截；到达 Worker 后，日常管理页还要过管理密码会话。Access JWT 与允许邮箱是重置路径上的身份校验，不是每个管理 API 的唯一登录方式。
 
 ### 2.6 初始化管理数据
 
@@ -131,7 +133,7 @@ Finalize 再次验证远程 D1 ID和五项 Core Secret，之后按顺序应用�
 - Server URL：Generator 的 HTTPS origin，例如 `https://generator.example.com`（不要填 Admin/Core）。
 - API Key：管理页刚显示一次的原始 Bitwarden Token。
 
-保存后生成。Bitwarden 会向 `POST /api/alias/random/new` 发送 `Authentication` header；请求里的 `hostname`/`mode` 会被忽略。成功只返回邮箱地址，绝不返回独立的 18 位邮箱密码。密码只在 Access 管理页经显式“显示密码”操作解密。
+保存后生成。Bitwarden 会向 `POST /api/alias/random/new` 发送 `Authentication` header；请求里的 `hostname`/`mode` 会被忽略。成功只返回邮箱地址，绝不返回独立的 18 位邮箱密码。密码只在管理页经显式“显示密码”操作解密。
 
 ## 3. 预发布真实烟测（必须由操作者完成）
 
@@ -144,7 +146,7 @@ Finalize 再次验证远程 D1 ID和五项 Core Secret，之后按顺序应用�
 - [ ] 重置其中一个密码；旧密码不能登录，新 18 位密码能登录。
 - [ ] 输入完整邮箱确认后永久删除；MXroute 查询确认账号不存在，管理页记录消失。
 - [ ] 用无效和已撤销 Token 请求 Generator，均返回 401 且响应无敏感字段。
-- [ ] 无 Access 会话/不在允许邮箱列表的浏览器无法打开 Admin。
+- [ ] 无 Access 会话（若已启用边缘保护）、无管理密码、或不在允许邮箱列表的浏览器无法使用 Admin。
 - [ ] 导出预发布 D1，确认没有明文邮箱密码、原始 Token、MXroute Key 或完整认证 header。
 - [ ] 检查 Worker 日志、API 响应、浏览器存储和构建后的 Admin 资产，无上述敏感值。
 
@@ -175,7 +177,7 @@ Finalize 再次验证远程 D1 ID和五项 Core Secret，之后按顺序应用�
 **绝不能覆盖或删除 `ENC_KEY_V1`。** 当前代码只读取 V1，尚未提供在线重加密命令，因此轮换必须先做一个经测试的代码/迁移版本：
 
 1. 新增 `ENC_KEY_V2` Secret，但保留 V1；代码同时读取 `{1: V1, 2: V2}`，新写入使用版本 2。
-2. 通过受 Access 保护、可审计、可重试的批处理逐条解密 V1 并用新 nonce/AAD 重加密为 V2；每批前做 D1 bookmark。
+2. 通过可审计、可重试的批处理逐条解密 V1 并用新 nonce/AAD 重加密为 V2；每批前做 D1 bookmark。该批处理须走受保护的管理面，不得暴露明文密码。
 3. 查询确认所有当前与候选密码的 key version 都为 2，并在预发布抽样登录、重置、恢复。
 4. 先部署不再写 V1 但仍可读 V1 的版本，观察完整恢复窗口。
 5. 最后部署移除 V1 读取的版本，再删除 `ENC_KEY_V1`。任何一步失败都保留两把钥匙并回滚代码，不能回滚到只认识 V1 的代码后继续写 V2。
